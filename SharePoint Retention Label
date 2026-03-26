@@ -1,0 +1,198 @@
+# =========================
+# RA - Compliance Gaps (Sensitivity, Retention, Audit Status)
+# =========================
+
+# --- Tenant / App ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# --- RA Sites to scan (updated) ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+$Sites = @(
+ 'https://cppib.sharepoint.com/teams/RA-EnergyandResources2',
+ 'https://cppib.sharepoint.com/teams/RA-Infrastructure',
+ 'https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation',
+ 'https://cppib.sharepoint.com/teams/RA-PowerandRenewables',
+ 'https://cppib.sharepoint.com/teams/RA-RealAssets',
+ 'https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin',
+ 'https://cppib.sharepoint.com/teams/RA-RealEstate',
+ 'https://cppib.sharepoint.com/teams/RA-RealEstateAsia',
+ 'https://cppib.sharepoint.com/teams/RA-ManagementCommittee',
+ 'https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup',
+ 'https://cppib.sharepoint.com/sites/RA-Infra',
+ 'https://cppib.sharepoint.com/sites/RA-LRA',
+ 'https://cppib.sharepoint.com/sites/RA-RE',
+ 'https://cppib.sharepoint.com/sites/RA-SE'
+)
+
+# --- Output setup ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+$OutDir = "C:\Users\$env:USERNAME\Documents"
+if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory -Force | Out-Null }
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+$outCsv = Join-Path $OutDir ("RA_Compliance_Gaps_{0}.csv" -f $timestamp)
+
+# --- Module ---
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# --- Retry helper ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+function Invoke-WithRetry {
+ param(
+   [Parameter(Mandatory=$true)][scriptblock]$Script,
+   [string]$What = 'operation',
+   [int]$MaxAttempts = 3,
+   [int]$BaseDelaySeconds = 4
+ )
+ for($i=1; $i -le $MaxAttempts; $i++){
+   try { return & $Script }
+   catch {
+     $msg = $_.Exception.Message
+     $isTimeout = ($msg -match 'HttpClient.Timeout' -or $msg -match 'timed out')
+     if ($isTimeout -and $i -lt $MaxAttempts){
+       $delay = [math]::Pow(2, ($i-1)) * $BaseDelaySeconds
+       Write-Warning "$What timed out (attempt $i/$MaxAttempts). Retrying in $delay sec..."
+       Start-Sleep -Seconds $delay
+       continue
+     }
+     throw
+   }
+ }
+}
+
+# --- Connect helper ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+function Connect-PP {
+ param([string]$SiteUrl)
+ Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive -ValidateConnection
+ $ctx = Get-PnPContext
+ try { $ctx.RequestTimeout = -1 } catch {}
+}
+
+# --- Unified Audit Availability ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+$UnifiedAuditEnabled = $null
+try {
+ $probe = Get-PnPUnifiedAuditLog -ContentType SharePoint -StartTime (Get-Date).AddDays(-1) -EndTime (Get-Date) -ResultSize 1 -ErrorAction Stop
+ $UnifiedAuditEnabled = $true
+} catch {
+ $UnifiedAuditEnabled = $false
+}
+
+# --- Helper: get default retention label ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+function Get-LibraryRetentionLabel {
+ param([object]$List)
+
+ try {
+   Get-PnPProperty -ClientObject $List -Property RootFolder | Out-Null
+   Get-PnPProperty -ClientObject $List.RootFolder -Property Properties | Out-Null
+   $props = $List.RootFolder.Properties
+   if ($props -and $props.FieldValues.ContainsKey('ComplianceTag')){
+     $val = $props.FieldValues['ComplianceTag']
+     return ($val -as [string])
+   }
+ } catch {}
+
+ return ''
+}
+
+# --- MAIN ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+$rows = New-Object System.Collections.Generic.List[object]
+
+foreach ($site in ($Sites | Sort-Object -Unique)){
+
+ Write-Host "`n>>> Processing $site" -ForegroundColor Yellow
+
+ try {
+   Invoke-WithRetry -What "Connect $site" -Script { Connect-PP -SiteUrl $site }
+
+   $web = Invoke-WithRetry -What "Get-PnPWeb $site" -Script {
+     Get-PnPWeb -Includes Title,Url
+   }
+
+   # A) Site Sensitivity Label
+   $siteLabelDisplay = ''
+   try {
+     $siteLabel = Invoke-WithRetry -What "Get-PnPSiteSensitivityLabel" -Script {
+       Get-PnPSiteSensitivityLabel
+     }
+     if ($siteLabel) { $siteLabelDisplay = $siteLabel.ToString() }
+   } catch {}
+
+   $missingSiteSensitivity = [string]::IsNullOrWhiteSpace($siteLabelDisplay) ? 'YES' : ''
+
+   # B) Retention Labels on Document Libraries
+   $libs = Invoke-WithRetry -What "Get-PnPList (doc libs)" -Script {
+     Get-PnPList -Includes Title,BaseTemplate,RootFolder |
+       Where-Object { $_.BaseTemplate -in @('DocumentLibrary',101) }
+   }
+
+   $libsTotal = $libs.Count
+   $libsWithDefault = 0
+   $libsMissingNames = New-Object System.Collections.Generic.List[string]
+
+   foreach ($l in $libs){
+     $label = Get-LibraryRetentionLabel -List $l
+     if ([string]::IsNullOrWhiteSpace($label)){
+       $libsMissingNames.Add($l.Title)
+     } else {
+       $libsWithDefault++
+     }
+   }
+
+   $libsMissingCount = $libsTotal - $libsWithDefault
+   $anyRetentionDefaultPresent = ($libsWithDefault -gt 0) ? 'YES' : ''
+
+   # C) Audit Logging Status
+   $auditDisabled = ($UnifiedAuditEnabled -eq $false) ? 'YES' : ''
+   $auditNote = ($UnifiedAuditEnabled -eq $false) ?
+      'Unified audit disabled at tenant (Purview)' :
+      'Unified audit enabled'
+
+   # Collect row
+   $rows.Add([pscustomobject]@{
+     SiteUrl                        = $web.Url
+     SiteTitle                      = $web.Title
+     SiteSensitivityLabel           = $siteLabelDisplay
+     MissingSiteSensitivityLabel    = $missingSiteSensitivity
+     LibrariesTotal                 = $libsTotal
+     LibrariesWithDefaultRetention  = $libsWithDefault
+     LibrariesMissingRetention      = $libsMissingCount
+     LibraryNamesMissingRetention   = ($libsMissingNames -join '; ')
+     AnyRetentionDefaultPresent     = $anyRetentionDefaultPresent
+     UnifiedAuditEnabled_Tenant     = ($UnifiedAuditEnabled ? 'YES' : 'NO')
+     AuditLoggingDisabled_Flag      = $auditDisabled
+     AuditStatusNote                = $auditNote
+   })
+
+ } catch {
+   Write-Warning ("Failed on {0} : {1}" -f $site, $_.Exception.Message)
+
+   $rows.Add([pscustomobject]@{
+     SiteUrl                      = $site
+     SiteTitle                    = ''
+     SiteSensitivityLabel         = ''
+     MissingSiteSensitivityLabel  = 'ERROR'
+     LibrariesTotal               = ''
+     LibrariesWithDefaultRetention= ''
+     LibrariesMissingRetention    = ''
+     LibraryNamesMissingRetention = ''
+     AnyRetentionDefaultPresent   = ''
+     UnifiedAuditEnabled_Tenant   = ($UnifiedAuditEnabled ? 'YES' : 'NO')
+     AuditLoggingDisabled_Flag    = ($UnifiedAuditEnabled ? '' : 'YES')
+     AuditStatusNote              = 'Connection or read error'
+   })
+
+   continue
+ }
+
+}
+
+# --- OUTPUT ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20Sites%20%E2%80%93%20Retention-Sensitivity-Audit%20Audit%20Command.txt)
+if (($rows | Measure-Object).Count -gt 0){
+ $rows |
+   Sort-Object MissingSiteSensitivityLabel, LibrariesMissingRetention, SiteUrl |
+   Export-Csv -NoTypeInformation -Encoding utf8BOM -Force $outCsv
+}
+else {
+ $cols = 'SiteUrl','SiteTitle','SiteSensitivityLabel','MissingSiteSensitivityLabel','LibrariesTotal','LibrariesWithDefaultRetention','LibrariesMissingRetention','LibraryNamesMissingRetention','AnyRetentionDefaultPresent','UnifiedAuditEnabled_Tenant','AuditLoggingDisabled_Flag','AuditStatusNote'
+ $null | Select-Object $cols | Export-Csv -NoTypeInformation -Encoding utf8BOM -Force $outCsv
+}
+
+Write-Host "`nSaved: $outCsv" -ForegroundColor Green
+try { Invoke-Item $outCsv } catch {}
