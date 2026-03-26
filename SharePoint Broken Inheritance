@@ -1,0 +1,425 @@
+# ============================================================
+# RA – Broken Inheritance (paths-first) + Counts per List/Library + per Folder
+# - Keeps original "paths-first" export (Site/Library/Folder/File/Item)
+# - Adds:
+#     1) AE_ListLibrary_ItemCounts_<ts>.csv  (totals per list/library + broken items)
+#     2) AE_Folder_ItemCounts_<ts>.csv       (totals per folder + broken descendants)
+# - PnP.PowerShell (CSOM + REST), timeout-safe, windowed enumeration
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+Import-Module PnP.PowerShell -Force
+
+# ---------- AUTH ----------
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# ---------- Sites to process (RA) ----------
+$AE_Sites = @(
+  "https://cppib.sharepoint.com/teams/RA-EnergyandResources2",
+  "https://cppib.sharepoint.com/teams/RA-Infrastructure",
+  "https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation",
+  "https://cppib.sharepoint.com/teams/RA-PowerandRenewables",
+  "https://cppib.sharepoint.com/teams/RA-RealAssets",
+  "https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin",
+  "https://cppib.sharepoint.com/teams/RA-RealEstate",
+  "https://cppib.sharepoint.com/teams/RA-RealEstateAsia",
+  "https://cppib.sharepoint.com/teams/RA-ManagementCommittee",
+  "https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup",
+  "https://cppib.sharepoint.com/sites/RA-Infra",
+  "https://cppib.sharepoint.com/sites/RA-LRA",
+  "https://cppib.sharepoint.com/sites/RA-RE",
+  "https://cppib.sharepoint.com/sites/RA-SE"
+) | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique
+
+# ---------- MODE / TUNING ----------
+$Mode = "DEEP"                # DEEP = exact totals for items; QUICK (not used here) would only flag presence
+$SleepBetweenSitesMs = 150
+$PerSiteHttpTimeoutMin = 10
+$CsomRequestTimeoutMin = 10
+# DEEP mode windows:
+$IdWindowSize = 2000
+$PageSize     = 500
+$MaxErrorsPerLib = 20
+
+# ---------- OUTPUT ----------
+$OutRoot = Join-Path $HOME "Documents\AE_Governance_UniquePerms"
+New-Item -ItemType Directory -Path $OutRoot -Force | Out-Null
+$stamp   = (Get-Date).ToString('yyyyMMdd_HHmm')
+
+# Original paths-first outputs
+$PathsCsv   = Join-Path $OutRoot "AE_BrokenInheritance_Paths_$stamp.csv"
+$SiteSumCsv = Join-Path $OutRoot "AE_BrokenInheritance_Summary_$stamp.csv"
+$ErrCsv     = Join-Path $OutRoot "AE_BrokenInheritance_Errors_$stamp.csv"
+$LogFile    = Join-Path $OutRoot "AE_BrokenInheritance_Log_$stamp.txt"
+
+# New counts outputs
+$CountsListLibCsv = Join-Path $OutRoot "AE_ListLibrary_ItemCounts_$stamp.csv"
+$CountsFolderCsv  = Join-Path $OutRoot "AE_Folder_ItemCounts_$stamp.csv"
+
+# ---------- LOGGING ----------
+function Write-Log([string]$Message,[string]$Level="INFO"){
+  $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+  Write-Host $line
+  Add-Content -Path $LogFile -Value $line
+}
+function Add-Err($SiteUrl,$Stage,$Message,$Context=$null){
+  $script:errRows.Add([pscustomobject]@{
+    SiteUrl=$SiteUrl; Stage=$Stage; Error=$Message; Context=$Context
+  }) | Out-Null
+}
+
+# ---------- RETRY / BACKOFF ----------
+function Invoke-WithRetry {
+  param([Parameter(Mandatory=$true)][scriptblock]$Action,[int]$MaxAttempts=5,[int]$BaseDelaySeconds=2,[string]$What='op')
+  $attempt = 0
+  while ($attempt -lt $MaxAttempts) {
+    try { return & $Action }
+    catch {
+      $attempt++
+      if ($attempt -ge $MaxAttempts) { throw }
+      Write-Warning "$What failed (attempt $attempt/$MaxAttempts). Retrying..."
+      Start-Sleep -Seconds ([math]::Pow(2,$attempt) * $BaseDelaySeconds)
+    }
+  }
+}
+
+# ---------- CONNECT ----------
+function Connect-Site {
+  param([Parameter(Mandatory=$true)][string]$SiteUrl)
+  # DeviceLogin works well for long runs; use -Interactive if you prefer
+  Connect-PnPOnline -Url $SiteUrl -Tenant $Tenant -ClientId $ClientId -Interactive -ValidateConnection
+  # Increase timeouts
+  try {
+    $cn = Get-PnPConnection
+    if ($cn -and $cn.HttpClient) { $cn.HttpClient.Timeout = [TimeSpan]::FromMinutes($PerSiteHttpTimeoutMin) }
+  } catch {}
+  try {
+    $ctx = Get-PnPContext
+    if ($ctx) { $ctx.RequestTimeout = [TimeSpan]::FromMinutes($CsomRequestTimeoutMin).TotalMilliseconds }
+  } catch {}
+}
+
+# ---------- HELPERS (paths-first) ----------
+$script:rows    = New-Object System.Collections.Generic.List[object]   # paths-first rows
+$script:errRows = New-Object System.Collections.Generic.List[object]
+$script:seenKeys= New-Object System.Collections.Generic.HashSet[string]
+
+function Add-BrokenPath {
+  param(
+    [string]$SiteUrl,
+    [string]$Scope,     # Site | Library | Folder | File | Item
+    [string]$Path,      # absolute URL
+    [string]$ListTitle = $null,
+    [int]$ItemId = $null
+  )
+  # key to ensure unique rows
+  $key = "$SiteUrl|$Scope|$Path"
+  if (-not $script:seenKeys.Contains($key)) {
+    [void]$script:seenKeys.Add($key)
+    $script:rows.Add([pscustomobject]@{
+      SiteUrl   = $SiteUrl
+      Scope     = $Scope
+      Path      = $Path
+      ListTitle = $ListTitle
+      ItemId    = $ItemId
+    }) | Out-Null
+  }
+}
+
+function Get-ItemType {
+  param($ListItem)
+  try {
+    $fs = $ListItem.FieldValues["FSObjType"]        # 1=Folder, 0=File/Item
+    $ct = $ListItem.FieldValues["ContentTypeId"]
+    if ($fs -eq 1) { return "Folder" }
+    elseif ($ct -like "0x0101*") { return "File" }  # 0x0101... are Document content types
+    else { return "Item" }
+  } catch { return "Item" }
+}
+
+function Get-MaxId {
+  param([Parameter(Mandatory=$true)]$List)
+  $q = @"
+<View Scope='RecursiveAll'>
+  <Query><OrderBy><FieldRef Name='ID' Ascending='False'/></OrderBy></Query>
+  <ViewFields><FieldRef Name='ID'/><FieldRef Name='FileRef'/></ViewFields>
+  <RowLimit>1</RowLimit>
+</View>
+"@
+  try { (Get-PnPListItem -List $List -Query $q -PageSize 1 -ErrorAction Stop | Select-Object -First 1).Id } catch { 0 }
+}
+
+function Enumerate-UniqueByWindows {
+  param(
+    [Parameter(Mandatory=$true)]$Web,
+    [Parameter(Mandatory=$true)]$List,
+    [Parameter(Mandatory=$true)][int]$MaxId,
+    [int]$WindowSize=2000,
+    [int]$PageSize=500
+  )
+  $errors = 0
+  for ($start=1; $start -le $MaxId; $start += $WindowSize) {
+    $end = [Math]::Min($start + $WindowSize - 1, $MaxId)
+    $q = @"
+<View Scope='RecursiveAll'>
+  <Query>
+    <Where>
+      <And>
+        <Geq><FieldRef Name='ID'/><Value Type='Counter'>$start</Value></Geq>
+        <Leq><FieldRef Name='ID'/><Value Type='Counter'>$end</Value></Leq>
+      </And>
+    </Where>
+    <OrderBy><FieldRef Name='ID' Ascending='True'/></OrderBy>
+  </Query>
+  <ViewFields>
+    <FieldRef Name='ID'/><FieldRef Name='FileRef'/><FieldRef Name='FSObjType'/><FieldRef Name='ContentTypeId'/>
+  </ViewFields>
+  <RowLimit>$PageSize</RowLimit>
+</View>
+"@
+    try {
+      $items = Get-PnPListItem -List $List -Query $q -PageSize $PageSize -Includes "HasUniqueRoleAssignments" -ErrorAction Stop
+      foreach ($it in $items) {
+        if ($it.HasUniqueRoleAssignments) {
+          $type = Get-ItemType -ListItem $it
+          $rel  = $it.FieldValues["FileRef"]           # server-relative
+          $abs  = ($Web.Url.TrimEnd('/')) + $rel
+          Add-BrokenPath -SiteUrl $Web.Url -Scope $type -Path $abs -ListTitle $List.Title -ItemId $it.Id
+        }
+      }
+    } catch {
+      $errors++
+      if ($errors -le $MaxErrorsPerLib) { Add-Err $Web.Url 'Enumerate/Window' $_.Exception.Message "$($List.Title) [$start-$end]" }
+    }
+  }
+}
+
+# ---------- HELPERS (counts) ----------
+$listLibCounts = New-Object System.Collections.Generic.List[object]
+$folderCounts  = New-Object System.Collections.Generic.List[object]
+
+function Get-ListTotalItemCount {
+  param([Parameter(Mandatory=$true)]$List,[int]$PageSize=1000)
+  try {
+    $tc = [int]$List.ItemCount
+    if ($tc -ge 0) { return $tc }
+  } catch {}
+  # fallback: paged ID-only count
+  $q = @"
+<View Scope='RecursiveAll'>
+  <ViewFields><FieldRef Name='ID'/></ViewFields>
+  <RowLimit>$PageSize</RowLimit>
+</View>
+"@
+  $count = 0
+  try {
+    $items = Get-PnPListItem -List $List -Query $q -PageSize $PageSize -Fields "ID"
+    foreach($i in $items){ $count++ }
+  } catch {}
+  return $count
+}
+
+function Get-ListBrokenItemCount {
+  param([Parameter(Mandatory=$true)]$List,[int]$PageSize=1000)
+  $q = @"
+<View Scope='RecursiveAll'>
+  <ViewFields>
+    <FieldRef Name='ID'/><FieldRef Name='FileRef'/><FieldRef Name='FSObjType'/><FieldRef Name='ContentTypeId'/>
+  </ViewFields>
+  <RowLimit>$PageSize</RowLimit>
+</View>
+"@
+  $broken = 0
+  try {
+    $items = Get-PnPListItem -List $List -Query $q -PageSize $PageSize -Includes "HasUniqueRoleAssignments"
+    foreach($it in $items){ if ($it.HasUniqueRoleAssignments) { $broken++ } }
+  } catch {}
+  return $broken
+}
+
+function Get-LibraryFolders {
+  param([Parameter(Mandatory=$true)]$List,[int]$PageSize=5000)
+  $q = @"
+<View Scope='RecursiveAll'>
+  <Query>
+    <Where><Eq><FieldRef Name='FSObjType'/><Value Type='Integer'>1</Value></Eq></Where>
+    <OrderBy><FieldRef Name='FileRef' Ascending='True'/></OrderBy>
+  </Query>
+  <ViewFields><FieldRef Name='FileRef'/><FieldRef Name='ID'/></ViewFields>
+  <RowLimit>$PageSize</RowLimit>
+</View>
+"@
+  try { return Get-PnPListItem -List $List -Query $q -PageSize $PageSize -Fields "FileRef","ID" } catch { return @() }
+}
+
+function Get-FolderCounts {
+  param([Parameter(Mandatory=$true)]$List,[Parameter(Mandatory=$true)][string]$FolderRel,[int]$PageSize=1000)
+  $total = 0; $broken = 0
+  $q = @"
+<View Scope='RecursiveAll'>
+  <Query><Where><BeginsWith><FieldRef Name='FileRef'/><Value Type='Text'>$FolderRel/</Value></BeginsWith></Where></Query>
+  <ViewFields><FieldRef Name='ID'/><FieldRef Name='FileRef'/></ViewFields>
+  <RowLimit>$PageSize</RowLimit>
+</View>
+"@
+  try {
+    $items = Get-PnPListItem -List $List -Query $q -PageSize $PageSize -Includes "HasUniqueRoleAssignments"
+    foreach($i in $items){ $total++; if ($i.HasUniqueRoleAssignments){ $broken++ } }
+  } catch {}
+  return @{ Total = $total; Broken = $broken }
+}
+
+# ---------- MAIN ----------
+$siteIndex = 0
+$siteSums  = New-Object System.Collections.Generic.List[object]
+
+Write-Log ("Sites in scope: {0}" -f $AE_Sites.Count)
+
+foreach ($site in $AE_Sites) {
+  $siteIndex++
+  Write-Log "[${siteIndex}/$($AE_Sites.Count)] Connecting: $site"
+  try {
+    Invoke-WithRetry -What "Connect $site" -Action { Connect-Site -SiteUrl $site } | Out-Null
+    $web = Get-PnPWeb -Includes Title, Url, HasUniqueRoleAssignments
+
+    # 1) Site-level break (paths-first)
+    try {
+      if ($web.HasUniqueRoleAssignments) {
+        Add-BrokenPath -SiteUrl $web.Url -Scope 'Site' -Path $web.Url
+      }
+    } catch {}
+
+    # 2) Get all lists (counts want *all* visible lists; folder detail only for doc libs)
+    $lists = @()
+    try {
+      $lists = Get-PnPList -Includes Title,BaseTemplate,Hidden,RootFolder,HasUniqueRoleAssignments,ItemCount
+      $lists = @($lists | Where-Object { -not $_.Hidden })
+    } catch {
+      Add-Err $site 'Lists/Get' $_.Exception.Message
+      continue
+    }
+
+    foreach ($l in $lists) {
+      try {
+        Get-PnPProperty -ClientObject $l -Property Title,RootFolder,HasUniqueRoleAssignments,ItemCount | Out-Null
+      } catch {
+        Add-Err $site 'List/PropertyLoad' $_.Exception.Message $l.Title
+        continue
+      }
+
+      # 2a) Library-level break (paths-first)
+      $listRel = ''
+      try { $listRel = $l.RootFolder.ServerRelativeUrl } catch {}
+      $listAbs = if($listRel){ ($web.Url.TrimEnd('/')) + $listRel } else { $web.Url }
+
+      if ($l.HasUniqueRoleAssignments) {
+        $scopeName = if ($l.BaseTemplate -eq 101) { 'Library' } else { 'List' }
+        Add-BrokenPath -SiteUrl $web.Url -Scope $scopeName -Path $listAbs -ListTitle $l.Title
+      }
+
+      # 2b) Counts per list/library (new)
+      $isDocLib = ($l.BaseTemplate -eq 101)
+      $listType = if ($isDocLib) { 'DocumentLibrary' } else { "List($($l.BaseTemplate))" }
+
+      $totalItems  = Get-ListTotalItemCount -List $l -PageSize 1000
+      $brokenItems = Get-ListBrokenItemCount -List $l -PageSize 1000
+
+      $listLibCounts.Add([pscustomobject]@{
+        SiteUrl                = $web.Url
+        SiteTitle              = $web.Title
+        ListTitle              = $l.Title
+        ListType               = $listType
+        ListUrl                = $listAbs
+        TotalItems             = $totalItems
+        BrokenInheritanceItems = $brokenItems
+        LibraryHasUniquePerms  = [bool]$l.HasUniqueRoleAssignments
+      }) | Out-Null
+
+      # 3) Item-level breaks (paths-first, DEEP for doc libs)
+      if ($Mode -eq "DEEP" -and $isDocLib) {
+        $maxId = Get-MaxId -List $l
+        if ($maxId -gt 0) {
+          Enumerate-UniqueByWindows -Web $web -List $l -MaxId $maxId -WindowSize $IdWindowSize -PageSize $PageSize
+        }
+      }
+
+      # 4) Folder counts (new; only for doc libs)
+      if ($isDocLib) {
+        $folders = Get-LibraryFolders -List $l -PageSize 5000
+        foreach($f in $folders){
+          $folderRel = $f.FieldValues["FileRef"]; if (-not $folderRel) { continue }
+          $folderAbs = ($web.Url.TrimEnd('/')) + $folderRel
+          $counts    = Get-FolderCounts -List $l -FolderRel $folderRel -PageSize 1000
+
+          $folderCounts.Add([pscustomobject]@{
+            SiteUrl                = $web.Url
+            SiteTitle              = $web.Title
+            ListTitle              = $l.Title
+            FolderPath             = $folderAbs
+            TotalItemsUnderFolder  = $counts.Total
+            BrokenInheritanceUnder = $counts.Broken
+          }) | Out-Null
+        }
+      }
+    } # end foreach list
+
+    # Per-site summary row (original summary style)
+    $siteTotal   = (@($script:rows | Where-Object { $_.SiteUrl -eq $web.Url })).Count
+    $siteFileCnt = (@($script:rows | Where-Object { $_.SiteUrl -eq $web.Url -and $_.Scope -eq 'File' })).Count
+    $siteSums.Add([pscustomobject]@{
+      SiteUrl          = $web.Url
+      SiteTitle        = $web.Title
+      TotalBrokenPaths = $siteTotal
+      BrokenFilesCount = $siteFileCnt
+    }) | Out-Null
+
+    Start-Sleep -Milliseconds $SleepBetweenSitesMs
+
+  } catch {
+    Add-Err $site 'ConnectOrProcess' $_.Exception.Message
+    continue
+  }
+}
+
+# ---------- FINALIZE / EXPORT ----------
+# Paths-first with internal counter (same presentation as original)
+$counter = 0
+$rowsOut =
+  $script:rows |
+  Sort-Object SiteUrl, Scope, Path |
+  ForEach-Object {
+    $counter++
+    [pscustomobject]@{
+      Counter  = $counter
+      SiteUrl  = $_.SiteUrl
+      Scope    = $_.Scope
+      Path     = $_.Path
+      ListTitle= $_.ListTitle
+      ItemId   = $_.ItemId
+    }
+  }
+
+# Original exports
+$rowsOut | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $PathsCsv
+$script:errRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $ErrCsv
+
+# Append an OVERALL row to the per-site summary
+$overall = [pscustomobject]@{
+  SiteUrl          = '*** OVERALL ***'
+  SiteTitle        = ''
+  TotalBrokenPaths = $rowsOut.Count
+  BrokenFilesCount = (@($rowsOut | Where-Object { $_.Scope -eq 'File' })).Count
+}
+$siteSums + $overall | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $SiteSumCsv
+
+# New counts exports
+$listLibCounts | Sort-Object SiteUrl, ListTitle | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CountsListLibCsv
+$folderCounts  | Sort-Object SiteUrl, ListTitle, FolderPath | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CountsFolderCsv
+
+Write-Host "`nCreated:" -ForegroundColor Green
+$PathsCsv
+$SiteSumCsv
+$CountsListLibCsv
+$CountsFolderCsv
+$ErrCsv
