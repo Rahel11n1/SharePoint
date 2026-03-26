@@ -1,0 +1,140 @@
+# ============================================
+# CI Sites – Sites without Classification + Hidden Libraries
+# ============================================
+
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# --- CI Sites ---
+$CI_Sites = @(
+ "https://cppib.sharepoint.com/teams/RA-EnergyandResources2",
+ "https://cppib.sharepoint.com/teams/RA-Infrastructure",
+ "https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation",
+ "https://cppib.sharepoint.com/teams/RA-PowerandRenewables",
+ "https://cppib.sharepoint.com/teams/RA-RealAssets",
+ "https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin",
+ "https://cppib.sharepoint.com/teams/RA-RealEstate",
+ "https://cppib.sharepoint.com/teams/RA-RealEstateAsia",
+ "https://cppib.sharepoint.com/teams/RA-ManagementCommittee",
+ "https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup",
+ "https://cppib.sharepoint.com/sites/RA-Infra",
+ "https://cppib.sharepoint.com/sites/RA-LRA",
+ "https://cppib.sharepoint.com/sites/RA-RE",
+ "https://cppib.sharepoint.com/sites/RA-SE"
+)
+
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# ---------- Connect helper ----------
+function Connect-PP {
+  param([string]$SiteUrl)
+  Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive
+}
+
+# ---------- Classification for a site ----------
+function Get-SiteClassification {
+  param([Guid]$GroupId)
+
+  # Return object with .Value and .Source properties
+  if($GroupId -and $GroupId -ne [Guid]::Empty){
+    try{
+      # Group-connected: read Microsoft 365 Group classification (Graph)
+      $g = Get-PnPMicrosoft365Group -Identity $GroupId -ErrorAction Stop   # needs Graph scopes/consent
+      $val = $g.Classification
+      return [pscustomobject]@{ Value = ($val ?? ''); Source = 'Group' }
+    } catch {
+      return [pscustomobject]@{ Value = ''; Source = 'GroupError' }
+    }
+  } else {
+    try{
+      # Non-group site: read Site.Classification
+      $site = Get-PnPSite -ErrorAction Stop
+      Get-PnPProperty -ClientObject $site -Property Classification | Out-Null
+      $val = $site.Classification
+      return [pscustomobject]@{ Value = ($val ?? ''); Source = 'Site' }
+    } catch {
+      return [pscustomobject]@{ Value = ''; Source = 'SiteError' }
+    }
+  }
+}
+
+# ---------- Hidden libraries ----------
+function Get-HiddenLibraries {
+  # Returns hidden document libraries with details
+  $libs = @()
+  try{
+    $lists = Get-PnPList -Includes Hidden, BaseType, Title, RootFolder, Id, ItemCount, IsSystemList, BaseTemplate
+    $libs = $lists | Where-Object { $_.BaseType -eq 'DocumentLibrary' -and $_.Hidden -eq $true }
+  } catch { }
+  return $libs
+}
+
+# ---------- Collectors ----------
+$classificationRows = [System.Collections.Generic.List[Object]]::new()
+$hiddenLibRows      = [System.Collections.Generic.List[Object]]::new()
+
+# ---------- MAIN ----------
+foreach($site in $CI_Sites){
+  Write-Host "`n>>> Processing $site" -ForegroundColor Cyan
+  try{
+    Connect-PP $site
+
+    $web = Get-PnPWeb -Includes Title, Url
+    $title = $web.Title
+
+    # Site info to know if group-connected (GroupId)
+    $siteInfo = Get-PnPSite -Includes GroupId -ErrorAction SilentlyContinue
+    $groupId  = if($siteInfo){ $siteInfo.GroupId } else { [Guid]::Empty }
+
+    # 1) Classification
+    $cls = Get-SiteClassification -GroupId $groupId
+    $missing = [string]::IsNullOrWhiteSpace($cls.Value)
+
+    $classificationRows.Add([pscustomobject]@{
+      SiteUrl             = $web.Url
+      SiteTitle           = $title
+      IsGroupConnected    = ($groupId -and $groupId -ne [Guid]::Empty)
+      ClassificationValue = $cls.Value
+      ClassificationSource= $cls.Source    # Group | Site | *Error
+      MissingClassification = $missing
+      CheckedAt           = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+    })
+
+    # 2) Hidden libraries
+    $hiddenLibs = Get-HiddenLibraries
+    foreach($lib in $hiddenLibs){
+      $hiddenLibRows.Add([pscustomobject]@{
+        SiteUrl         = $web.Url
+        SiteTitle       = $title
+        LibraryTitle    = $lib.Title
+        ServerRelativeUrl = $lib.RootFolder.ServerRelativeUrl
+        ListId          = $lib.Id
+        ItemCount       = $lib.ItemCount
+        IsSystemList    = $lib.IsSystemList
+        BaseTemplate    = $lib.BaseTemplate
+        Hidden          = $lib.Hidden
+      })
+    }
+
+  } catch {
+    Write-Warning "Failed on $site : $($_.Exception.Message)"
+    $classificationRows.Add([pscustomobject]@{
+      SiteUrl = $site; SiteTitle = ''; IsGroupConnected = $null
+      ClassificationValue=''; ClassificationSource='Error'; MissingClassification=$true
+      CheckedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+    })
+  }
+}
+
+# ---------- EXPORT ----------
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+
+$clsOut = "SitesWithoutClassification_${timestamp}.csv"
+$classificationRows | Export-Csv -NoTypeInformation -Encoding UTF8BOM $clsOut
+
+$hidOut = "CI_HiddenLibraries_${timestamp}.csv"
+$hiddenLibRows | Export-Csv -NoTypeInformation -Encoding UTF8BOM $hidOut
+
+Write-Host "`nSaved:" -ForegroundColor Green
+Write-Host " - $clsOut"
+Write-Host " - $hidOut"
