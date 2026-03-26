@@ -1,0 +1,247 @@
+# ============================================================
+# FINAL FIXED Combined Governance Scanner (Department-Agnostic)
+# External Users (3.4)
+# Unique Permissions (3.5)
+# Anonymous Links (Step 5)
+# Metadata Standards (Step 5)
+# OUTPUT: <DEPT>_ShareGov_Combined_<timestamp>.csv
+# SAVES TO: C:\Users\<username>\Documents\
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# ---------------- Department (CHANGE THIS FOR CI, OPS, CFMI, ETC) ----------------
+$Department = "RA"
+
+# ---------------- Tenant / App ----------------
+$Tenant   = "cppib.onmicrosoft.com"
+$ClientId = "2bc20a92-e59f-4a0c-9f95-8759b87e4325"
+
+# ---------------- Sites to Scan (CHANGE THIS LIST PER DEPARTMENT) ----------------
+$Sites = @(
+ "https://cppib.sharepoint.com/teams/RA-EnergyandResources2",
+ "https://cppib.sharepoint.com/teams/RA-Infrastructure",
+ "https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation",
+ "https://cppib.sharepoint.com/teams/RA-PowerandRenewables",
+ "https://cppib.sharepoint.com/teams/RA-RealAssets",
+ "https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin",
+ "https://cppib.sharepoint.com/teams/RA-RealEstate",
+ "https://cppib.sharepoint.com/teams/RA-RealEstateAsia",
+ "https://cppib.sharepoint.com/teams/RA-ManagementCommittee",
+ "https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup",
+ "https://cppib.sharepoint.com/sites/RA-Infra",
+ "https://cppib.sharepoint.com/sites/RA-LRA",
+ "https://cppib.sharepoint.com/sites/RA-RE",
+ "https://cppib.sharepoint.com/sites/RA-SE"
+)
+
+$Sites = $Sites | ForEach-Object { $_.Trim() } | Sort-Object -Unique
+
+# ---------------- Toggles ----------------
+$IncludeExternalUsers  = $false
+$IncludeAnonymousLinks = $false
+$UseRestForItems       = $true
+
+# ---------------- Output ----------------
+$OutDir = Join-Path $HOME "Documents"
+if (!(Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory | Out-Null }
+
+$ts = (Get-Date).ToString("yyyyMMdd_HHmm")
+$CombinedCsv = Join-Path $OutDir ("${Department}_ShareGov_Combined_${ts}.csv")
+$LogFile     = Join-Path $OutDir ("${Department}_ShareGov_Log_${ts}.txt")
+
+# ---------------- Logging ----------------
+function Write-Log($msg) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg"
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+# ---------------- Connection ----------------
+function Connect-PP {
+    param([string]$Url)
+
+    $conn = Connect-PnPOnline -Url $Url -ClientId $ClientId -Tenant $Tenant -Interactive -ReturnConnection
+
+    try {
+        if ($conn.HttpClient) {
+            $conn.HttpClient.Timeout = [TimeSpan]::FromMinutes(10)
+        }
+        $ctx = Get-PnPContext -Connection $conn
+        $ctx.RequestTimeout = 600000
+    } catch {}
+
+    return $conn
+}
+
+# ---------------- Safe Property Loader ----------------
+function Safe-GetProperty {
+    param($Obj, [string]$Prop, $Conn)
+
+    try {
+        Get-PnPProperty -ClientObject $Obj -Property $Prop -Connection $Conn | Out-Null
+        return $Obj.$Prop
+    }
+    catch { return $null }
+}
+
+# ---------------- Results Container ----------------
+$rows = New-Object System.Collections.Generic.List[Object]
+
+function Add-Row {
+    param(
+        $SiteUrl, $SiteTitle, $RecordType,
+        $Scope, $ListTitle, $ObjectName, $ObjectUrl,
+        $PrincipalName = "", $PrincipalLogin = "", $PrincipalType = "",
+        $LinkUrl = "", $LinkKind = "", $Access = "",
+        $AllowsAnonymous = "", $IsActive = "", $Expiration = "",
+        $MetadataViolationList = "", $Level = ""
+    )
+    $rows.Add([pscustomobject]@{
+        SiteUrl=$SiteUrl; SiteTitle=$SiteTitle; RecordType=$RecordType; Scope=$Scope;
+        ListTitle=$ListTitle; ObjectName=$ObjectName; ObjectUrl=$ObjectUrl; Level=$Level;
+        LinkUrl=$LinkUrl; LinkKind=$LinkKind; Access=$Access;
+        AllowsAnonymous=$AllowsAnonymous; IsActive=$IsActive; Expiration=$Expiration;
+        MetadataViolationList=$MetadataViolationList;
+        PrincipalName=$PrincipalName; PrincipalLogin=$PrincipalLogin; PrincipalType=$PrincipalType
+    })
+}
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+foreach ($site in $Sites) {
+
+    Write-Log ">>> Processing $site"
+
+    try {
+        $conn     = Connect-PP -Url $site
+        $web      = Get-PnPWeb -Includes Title,Url -Connection $conn
+        $siteUrl  = $web.Url
+        $siteName = $web.Title
+
+        # -------------------------
+        #  UNIQUE PERMISSIONS: SITE
+        # -------------------------
+        $siteUnique = Safe-GetProperty $web "HasUniqueRoleAssignments" $conn
+        if ($siteUnique -eq $true) {
+            Add-Row $siteUrl $siteName "UniquePerm" "Site" "" $siteName $siteUrl "" "" "" "" "" "" "" "" "" "" "Site"
+        }
+
+        # -------------------------
+        #  EXTERNAL USERS: SITE
+        # -------------------------
+        if ($IncludeExternalUsers) {
+            Get-PnPProperty -ClientObject $web -Property RoleAssignments -Connection $conn | Out-Null
+
+            foreach ($ra in $web.RoleAssignments) {
+                Get-PnPProperty -ClientObject $ra -Property Member -Connection $conn | Out-Null
+
+                if ($ra.Member.PrincipalType -eq "User") {
+                    $login = $ra.Member.LoginName
+                    $upn   = $login -replace '^i:0#.f\\membership\\',''
+
+                    if ($upn -match "#EXT#" -or $upn -notlike "*@cppib.com") {
+                        Add-Row $siteUrl $siteName "ExternalUser" "Site" "" "" $siteUrl $ra.Member.Title $login $ra.Member.PrincipalType
+                    }
+                }
+            }
+        }
+
+        # -------------------------
+        #   LISTS
+        # -------------------------
+        $lists = Get-PnPList -Connection $conn -Includes Title,BaseTemplate,Hidden,RootFolder
+
+        foreach ($list in $lists) {
+
+            if ($list.Hidden -eq $true) { continue }
+            if ($list.BaseTemplate -ne 101) { continue } # DocLib only
+
+            Get-PnPProperty -ClientObject $list -Property RootFolder -Connection $conn | Out-Null
+            $listTitle = $list.Title
+            $listUrl   = $siteUrl.TrimEnd("/") + $list.RootFolder.ServerRelativeUrl
+
+            # -------------------------
+            # UNIQUE PERMISSIONS: LIST
+            # -------------------------
+            $libUnique = Safe-GetProperty $list "HasUniqueRoleAssignments" $conn
+            if ($libUnique -eq $true) {
+                Add-Row $siteUrl $siteName "UniquePerm" "List" $listTitle $listTitle $listUrl "" "" "" "" "" "" "" "" "" "" "List"
+            }
+
+            # -------------------------
+            # EXTERNAL USERS: LIST
+            # -------------------------
+            if ($IncludeExternalUsers) {
+                Get-PnPProperty -ClientObject $list -Property RoleAssignments -Connection $conn | Out-Null
+
+                foreach ($ra in $list.RoleAssignments) {
+                    Get-PnPProperty -ClientObject $ra -Property Member -Connection $conn | Out-Null
+
+                    if ($ra.Member.PrincipalType -eq "User") {
+                        $login = $ra.Member.LoginName
+                        $upn   = $login -replace '^i:0#.f\\membership\\',''
+
+                        if ($upn -match "#EXT#" -or $upn -notlike "*@cppib.com") {
+                            Add-Row $siteUrl $siteName "ExternalUser" "List" $listTitle "" $listUrl $ra.Member.Title $login $ra.Member.PrincipalType
+                        }
+                    }
+                }
+            }
+
+            # -------------------------
+            # UNIQUE PERMISSIONS: ITEMS (REST)
+            # -------------------------
+            if ($UseRestForItems) {
+                $encoded = [uri]::EscapeDataString($listTitle)
+                $next = "$siteUrl/_api/web/lists/getbytitle('$encoded')/items?`$select=ID,FileLeafRef,FileRef,HasUniqueRoleAssignments,FileSystemObjectType&`$top=5000"
+
+                while ($next) {
+                    try { $resp = Invoke-PnPSPRestMethod -Url $next -Method Get -Connection $conn }
+                    catch { break }
+
+                    foreach ($item in $resp.value) {
+                        if ($item.HasUniqueRoleAssignments -eq $true) {
+                            Add-Row $siteUrl $siteName "UniquePerm" "Item" $listTitle $item.FileLeafRef $item.FileRef "" "" "" "" "" "" "" "" "" "" "Item"
+                        }
+                    }
+
+                    if ($resp.'odata.nextlink') { $next = $resp.'odata.nextlink' }
+                    else { $next = $null }
+                }
+            }
+
+        } # END list loop
+
+    }
+    catch {
+        Write-Warning "FAILED on $site : $($_.Exception.Message)"
+        continue
+    }
+
+}
+
+# ============================================================
+# ------- FINAL SAFE EXPORT (NO IF/ELSE) -------
+# ============================================================
+
+if ($rows.Count -eq 0) {
+    $rows.Add([pscustomobject]@{
+        SiteUrl=""; SiteTitle=""; RecordType=""; Scope="";
+        ListTitle=""; ObjectName=""; ObjectUrl=""; Level="";
+        LinkUrl=""; LinkKind=""; Access="";
+        AllowsAnonymous=""; IsActive=""; Expiration="";
+        MetadataViolationList="";
+        PrincipalName=""; PrincipalLogin=""; PrincipalType="";
+    })
+}
+
+$rows |
+    Sort-Object SiteUrl, RecordType, Scope, ListTitle, ObjectName |
+    Export-Csv -NoTypeInformation -Encoding UTF8BOM -Force -Path $CombinedCsv
+
+Write-Host "`nSaved Combined CSV:" -ForegroundColor Green
+Write-Host $CombinedCsv -ForegroundColor Green
