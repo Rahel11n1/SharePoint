@@ -1,0 +1,137 @@
+# ============================================================
+# RA – Full Control Audit WITH MEMBER EXPANSION
+# ============================================================
+
+$Tenant   = "cppib.onmicrosoft.com"
+$ClientId = "2bc20a92-e59f-4a0c-9f95-8759b87e4325"
+
+# R A   S I T E S
+$Sites = @(
+ 'https://cppib.sharepoint.com/sites/RA-Infra',
+ 'https://cppib.sharepoint.com/sites/RA-LRA',
+ 'https://cppib.sharepoint.com/sites/RA-RE',
+ 'https://cppib.sharepoint.com/sites/RA-SE',
+ 'https://cppib.sharepoint.com/teams/RA-EnergyandResources2',
+ 'https://cppib.sharepoint.com/teams/RA-Infrastructure',
+ 'https://cppib.sharepoint.com/teams/RA-ManagementCommittee',
+ 'https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation',
+ 'https://cppib.sharepoint.com/teams/RA-PowerandRenewables',
+ 'https://cppib.sharepoint.com/teams/RA-RealAssets',
+ 'https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin',
+ 'https://cppib.sharepoint.com/teams/RA-RealEstate',
+ 'https://cppib.sharepoint.com/teams/RA-RealEstateAsia',
+ 'https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup'
+)
+
+# OUTPUT
+$OutDir = "C:\Users\$env:USERNAME\Documents"
+if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory | Out-Null }
+$timestamp = (Get-Date).ToString("yyyyMMdd_HHmm")
+$outCsv = Join-Path $OutDir ("RA_FullControl_ExpandedMembers_$timestamp.csv")
+
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+function Connect-PP {
+    param([string]$Url)
+    Connect-PnPOnline -Url $Url -ClientId $ClientId -Tenant $Tenant -Interactive -ValidateConnection
+    $ctx = Get-PnPContext
+    try { $ctx.RequestTimeout = -1 } catch {}
+}
+
+$rows = New-Object System.Collections.Generic.List[object]
+
+# ============================
+# MAIN LOOP
+# ============================
+foreach ($site in $Sites) {
+
+    Write-Host "`n>>> Processing $site" -ForegroundColor Cyan
+
+    try {
+        Connect-PP $site
+
+        $web = Get-PnPWeb -Includes Title,Url,RoleAssignments
+
+        # Load role assignments
+        Get-PnPProperty -ClientObject $web -Property RoleAssignments | Out-Null
+
+        foreach ($ra in $web.RoleAssignments) {
+
+            Get-PnPProperty -ClientObject $ra -Property Member,RoleDefinitionBindings | Out-Null
+
+            foreach ($role in $ra.RoleDefinitionBindings) {
+
+                if ($role.Name -eq "Full Control" -or $role.RoleTypeKind -eq "Administrator") {
+
+                    # Case 1 — Principal is a SharePoint Group
+                    if ($ra.Member.PrincipalType -eq "SharePointGroup") {
+
+                        $groupName = $ra.Member.Title
+
+                        # Expand group members
+                        $members = Get-PnPGroupMember -Identity $groupName -ErrorAction SilentlyContinue
+
+                        if ($members.Count -gt 0) {
+                            foreach ($m in $members) {
+                                $rows.Add([pscustomobject]@{
+                                    SiteUrl        = $web.Url
+                                    SiteTitle      = $web.Title
+                                    Scope          = "Site"
+                                    Object         = $web.Url
+                                    Role           = $role.Name
+                                    GroupName      = $groupName
+                                    MemberName     = $m.Title
+                                    MemberLogin    = $m.LoginName
+                                    MemberType     = $m.PrincipalType
+                                })
+                            }
+                        }
+                        else {
+                            # No members in group
+                            $rows.Add([pscustomobject]@{
+                                SiteUrl        = $web.Url
+                                SiteTitle      = $web.Title
+                                Scope          = "Site"
+                                Object         = $web.Url
+                                Role           = $role.Name
+                                GroupName      = $groupName
+                                MemberName     = ""
+                                MemberLogin    = ""
+                                MemberType     = ""
+                            })
+                        }
+
+                    }
+                    else {
+                        # Case 2 — Principal is directly a USER (rare)
+                        $rows.Add([pscustomobject]@{
+                            SiteUrl        = $web.Url
+                            SiteTitle      = $web.Title
+                            Scope          = "Site"
+                            Object         = $web.Url
+                            Role           = $role.Name
+                            GroupName      = ""
+                            MemberName     = $ra.Member.Title
+                            MemberLogin    = $ra.Member.LoginName
+                            MemberType     = $ra.Member.PrincipalType
+                        })
+                    }
+                }
+            }
+        }
+
+    } catch {
+        Write-Warning "Failed on $site : $($_.Exception.Message)"
+    }
+
+}
+
+# ============================
+# EXPORT
+# ============================
+$rows |
+  Sort-Object SiteUrl, GroupName, MemberName |
+  Export-Csv -NoTypeInformation -Encoding UTF8BOM -Force $outCsv
+
+Write-Host "`nSaved: $outCsv" -ForegroundColor Green
+try { Invoke-Item $outCsv } catch {}
