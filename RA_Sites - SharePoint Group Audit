@@ -1,0 +1,288 @@
+# =========================
+# RA - SharePoint Group Governance (PnP-only)
+# - Flags: Unused groups, Groups with no members, Groups with external members
+# - Checks usage at Site (web), Lists with unique permissions, and optional Items
+# - Saves to C:\Users\<username>\Documents
+# =========================
+
+# --- Entra ID App ---
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# --- RA Sites to scan (UPDATED) ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA_Sites%20-%20SharePoint%20Group%20Audit.txt)
+$Sites = @(
+ 'https://cppib.sharepoint.com/teams/RA-EnergyandResources2',
+ 'https://cppib.sharepoint.com/teams/RA-Infrastructure',
+ 'https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation',
+ 'https://cppib.sharepoint.com/teams/RA-PowerandRenewables',
+ 'https://cppib.sharepoint.com/teams/RA-RealAssets',
+ 'https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin',
+ 'https://cppib.sharepoint.com/teams/RA-RealEstate',
+ 'https://cppib.sharepoint.com/teams/RA-RealEstateAsia',
+ 'https://cppib.sharepoint.com/teams/RA-ManagementCommittee',
+ 'https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup',
+ 'https://cppib.sharepoint.com/sites/RA-Infra',
+ 'https://cppib.sharepoint.com/sites/RA-LRA',
+ 'https://cppib.sharepoint.com/sites/RA-RE',
+ 'https://cppib.sharepoint.com/sites/RA-SE'
+)
+
+# --- Settings ---
+[bool]$IncludeItemLevelChecks = $false   # slower if true
+$OutDir = "C:\Users\$env:USERNAME\Documents"
+if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory -Force | Out-Null }
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+$outCsv    = Join-Path $OutDir ("RA_SPGroup_Audit_{0}.csv" -f $timestamp)
+
+# --- Load PnP ---
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# --- Retry helper ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA_Sites%20-%20SharePoint%20Group%20Audit.txt)
+function Invoke-WithRetry {
+ param(
+  [Parameter(Mandatory=$true)][scriptblock]$Script,
+  [string]$What = 'operation',
+  [int]$MaxAttempts = 3,
+  [int]$BaseDelaySeconds = 4
+ )
+ for ($i=1; $i -le $MaxAttempts; $i++){
+  try { return & $Script }
+  catch {
+   $msg = $_.Exception.Message
+   $isTimeout = ($msg -match 'HttpClient.Timeout' -or $msg -match 'timed out')
+   if ($isTimeout -and $i -lt $MaxAttempts) {
+     $delay = [math]::Pow(2, ($i-1)) * $BaseDelaySeconds
+     Write-Warning "$What timed out (attempt $i/$MaxAttempts). Retrying in $delay sec..."
+     Start-Sleep -Seconds $delay
+     continue
+   }
+   throw
+  }
+ }
+}
+
+# --- Connect helper ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA_Sites%20-%20SharePoint%20Group%20Audit.txt)
+function Connect-PP {
+ param([string]$SiteUrl)
+ Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive -ValidateConnection
+ $ctx = Get-PnPContext
+ try { $ctx.RequestTimeout = -1 } catch {}
+}
+
+# --- Expand members + external user detection ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA_Sites%20-%20SharePoint%20Group%20Audit.txt)
+function Get-SPGroupMembersInfo {
+ param([object]$Group)
+
+ $members = Invoke-WithRetry -What "Get-PnPGroupMember $($Group.Title)" -Script {
+   Get-PnPGroupMember -Group $Group -ErrorAction SilentlyContinue
+ }
+
+ $total = 0
+ $external = 0
+ $containsAAD = $false
+ $examples = New-Object System.Collections.Generic.List[string]
+
+ foreach($m in $members){
+   $total++
+   switch ($m.PrincipalType) {
+     'User' {
+       $login = $m.LoginName
+       $email = $m.Email
+       if ($login -match '#EXT#' -or $email -match '#EXT#') { $external++ }
+       if ($examples.Count -lt 3) { $examples.Add($m.Title) }
+     }
+     default {
+       $login = $m.LoginName
+       if ($login -match 'c:0t\.c\\tenant\\([0-9a-f-]{36})'){
+         $containsAAD = $true
+         $aadId = $matches[1]
+         try {
+           $aadMembers = Invoke-WithRetry -What "Get-PnPAzureADGroupMember $aadId" -Script {
+             Get-PnPAzureADGroupMember -Identity $aadId -ErrorAction Stop
+           }
+           foreach($am in $aadMembers){
+             if ($am.UserPrincipalName -match '#EXT#') { $external++ }
+             if ($examples.Count -lt 3) { $examples.Add($am.DisplayName) }
+           }
+         } catch {}
+       } else {
+         if ($examples.Count -lt 3) { $examples.Add($m.Title) }
+       }
+     }
+   }
+ }
+
+ return [pscustomobject]@{
+   MemberCount        = $total
+   ExternalMemberCount= $external
+   ContainsAADGroup   = $containsAAD
+   ExampleMembers     = ($examples -join '; ')
+ }
+}
+
+# --- Map where SP Groups are used (site/lists/items) ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA_Sites%20-%20SharePoint%20Group%20Audit.txt)
+function Get-SPGroupUsage {
+ param($Web,[bool]$IncludeItemLevelChecks)
+
+ $usage = @{}
+
+ # --- Site usage ---
+ try {
+   Invoke-WithRetry -What "Load Web.RoleAssignments" -Script {
+     Get-PnPProperty -ClientObject $Web -Property RoleAssignments | Out-Null
+   }
+   foreach($ra in $Web.RoleAssignments){
+     Invoke-WithRetry -What "Expand RA at Web" -Script {
+       Get-PnPProperty -ClientObject $ra -Property Member,RoleDefinitionBindings | Out-Null
+     }
+     if ($ra.Member.PrincipalType.ToString() -match 'SharePointGroup'){
+       $title = $ra.Member.Title
+       if (-not $usage.ContainsKey($title)) { $usage[$title] = @($false,0,0) }
+       $usage[$title][0] = $true
+     }
+   }
+ } catch {}
+
+ # --- Lists w/ unique permissions ---
+ $lists = Invoke-WithRetry -What "Get-PnPList uniques" -Script {
+   Get-PnPList -Includes HasUniqueRoleAssignments,Title,RootFolder,RoleAssignments
+ }
+ $lists = $lists | Where-Object { $_.HasUniqueRoleAssignments -eq $true }
+
+ foreach($list in $lists){
+   try {
+     Invoke-WithRetry -What "Load List.RoleAssignments" -Script {
+       Get-PnPProperty -ClientObject $list -Property RoleAssignments | Out-Null
+     }
+
+     foreach($ra in $list.RoleAssignments){
+       Invoke-WithRetry -What "Expand RA at List" -Script {
+         Get-PnPProperty -ClientObject $ra -Property Member,RoleDefinitionBindings | Out-Null
+       }
+       if ($ra.Member.PrincipalType.ToString() -match 'SharePointGroup'){
+         $title = $ra.Member.Title
+         if (-not $usage.ContainsKey($title)) { $usage[$title] = @($false,0,0) }
+         $usage[$title][1] = $usage[$title][1] + 1
+       }
+     }
+   } catch {}
+ }
+
+ # --- OPTIONAL: Item usage ---
+ if ($IncludeItemLevelChecks){
+   foreach($list in $lists){
+     $items = Invoke-WithRetry -What "Get-PnPListItem uniques" -Script {
+       Get-PnPListItem -List $list -PageSize 200
+     }
+
+     foreach($item in $items){
+       try {
+         Get-PnPProperty -ClientObject $item -Property HasUniqueRoleAssignments | Out-Null
+         if ($item.HasUniqueRoleAssignments){
+           Get-PnPProperty -ClientObject $item -Property RoleAssignments | Out-Null
+           foreach($ra in $item.RoleAssignments){
+             Get-PnPProperty -ClientObject $ra -Property Member,RoleDefinitionBindings | Out-Null
+             if ($ra.Member.PrincipalType.ToString() -match 'SharePointGroup'){
+               $title = $ra.Member.Title
+               if (-not $usage.ContainsKey($title)) { $usage[$title] = @($false,0,0) }
+               $usage[$title][2] = $usage[$title][2] + 1
+             }
+           }
+         }
+       } catch {}
+     }
+   }
+ }
+
+ return $usage
+}
+
+# ===========================
+# MAIN EXECUTION
+# ===========================
+$rows = New-Object System.Collections.Generic.List[object]
+
+foreach($site in ($Sites | Sort-Object -Unique)){
+
+ Write-Host "`n>>> Processing $site" -ForegroundColor Yellow
+
+ try {
+   Invoke-WithRetry -What "Connect $site" -Script { Connect-PP -SiteUrl $site }
+
+   $web = Invoke-WithRetry -What "Get-PnPWeb $site" -Script {
+     Get-PnPWeb -Includes Title,Url,RoleAssignments
+   }
+   $siteTitle = $web.Title
+
+   # Build usage map
+   $usageMap = Get-SPGroupUsage -Web $web -IncludeItemLevelChecks $IncludeItemLevelChecks
+
+   $spGroups = Invoke-WithRetry -What "Get-PnPGroup list" -Script { Get-PnPGroup }
+
+   foreach($g in $spGroups){
+
+     $info = Get-SPGroupMembersInfo -Group $g
+
+     $siteUse = $false
+     $listUse = 0
+     $itemUse = 0
+
+     if ($usageMap.ContainsKey($g.Title)){
+       $siteUse = $usageMap[$g.Title][0]
+       $listUse = $usageMap[$g.Title][1]
+       $itemUse = $usageMap[$g.Title][2]
+     }
+
+     $unused     = (-not $siteUse -and $listUse -eq 0 -and $itemUse -eq 0)
+     $noMembers  = ($info.MemberCount -eq 0)
+     $external   = ($info.ExternalMemberCount -gt 0)
+
+     $rows.Add([pscustomobject]@{
+       SiteUrl             = $web.Url
+       SiteTitle           = $siteTitle
+       GroupTitle          = $g.Title
+       GroupLogin          = $g.LoginName
+       GroupId             = $g.Id
+       MemberCount         = $info.MemberCount
+       ExternalMemberCount = $info.ExternalMemberCount
+       ContainsAADGroup    = $info.ContainsAADGroup
+       ExampleMembers      = $info.ExampleMembers
+       UsedAtSite          = $siteUse
+       UsedAtListsCount    = $listUse
+       UsedAtItemsCount    = $itemUse
+       UnusedGroup         = $(if($unused){'YES'}else{''})
+       NoMembers           = $(if($noMembers){'YES'}else{''})
+       HasExternalMembers  = $(if($external){'YES'}else{''})
+     })
+
+   }
+
+ } catch {
+   Write-Warning ("Failed on {0} : {1}" -f $site, $_.Exception.Message)
+   $rows.Add([pscustomobject]@{
+     SiteUrl=$site; SiteTitle=''; GroupTitle=''; GroupLogin=''; GroupId='';
+     MemberCount=''; ExternalMemberCount=''; ContainsAADGroup='';
+     ExampleMembers=''; UsedAtSite=''; UsedAtListsCount='';
+     UsedAtItemsCount=''; UnusedGroup='ERROR'; NoMembers='';
+     HasExternalMembers='';
+   })
+   continue
+ }
+
+}
+
+# ===========================
+# OUTPUT (Always write CSV)
+# ===========================
+if (($rows | Measure-Object).Count -gt 0){
+ $rows |
+   Sort-Object SiteUrl, UnusedGroup, NoMembers, HasExternalMembers, GroupTitle |
+   Export-Csv -NoTypeInformation -Encoding UTF8BOM -Force $outCsv
+} 
+else {
+ $columns = 'SiteUrl','SiteTitle','GroupTitle','GroupLogin','GroupId','MemberCount','ExternalMemberCount','ContainsAADGroup','ExampleMembers','UsedAtSite','UsedAtListsCount','UsedAtItemsCount','UnusedGroup','NoMembers','HasExternalMembers'
+ $null | Select-Object $columns | Export-Csv -NoTypeInformation -Encoding UTF8BOM -Force $outCsv
+}
+
+Write-Host "`nSaved: $outCsv" -ForegroundColor Green
+try { Invoke-Item $outCsv } catch {}
