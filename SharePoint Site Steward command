@@ -1,0 +1,257 @@
+# =========================
+# RA Site Stewards - Deep Resolver (PnP-only)  -- CFMI-exact logic, RA URLs
+# - Captures Site Steward SP group(s) + AAD group(s) + expanded users
+# - Includes Owners and M365 Group Owners
+# - Output is one line per site + effective group + user (AAD container rows are filtered out)
+# =========================
+
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# --- RA Sites to process (as provided) ---
+$Sites = @(
+  "https://cppib.sharepoint.com/teams/RA-EnergyandResources2",
+  "https://cppib.sharepoint.com/teams/RA-Infrastructure",
+  "https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation",
+  "https://cppib.sharepoint.com/teams/RA-PowerandRenewables",
+  "https://cppib.sharepoint.com/teams/RA-RealAssets",
+  "https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin",
+  "https://cppib.sharepoint.com/teams/RA-RealEstate",
+  "https://cppib.sharepoint.com/teams/RA-RealEstateAsia",
+  "https://cppib.sharepoint.com/teams/RA-ManagementCommittee",
+  "https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup",
+  "https://cppib.sharepoint.com/sites/RA-Infra",
+  "https://cppib.sharepoint.com/sites/RA-LRA",
+  "https://cppib.sharepoint.com/sites/RA-RE",
+  "https://cppib.sharepoint.com/sites/RA-SE"
+)
+
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+$outFile   = "RA_SiteStewardsDeep_PnP_${timestamp}_withSteward.csv"
+
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# --- PnP group-members compat wrapper (handles both singular/plural cmdlet names) ---
+$script:UsePlural = $false
+if (Get-Command -Name Get-PnPGroupMembers -ErrorAction SilentlyContinue) {
+    $script:UsePlural = $true
+} elseif (-not (Get-Command -Name Get-PnPGroupMember -ErrorAction SilentlyContinue)) {
+    throw "Neither Get-PnPGroupMembers nor Get-PnPGroupMember is available. Ensure PnP.PowerShell is installed/imported."
+}
+function Get-PnPGroupMembersCompat {
+    param([Parameter(Mandatory)]$IdentityOrGroup)
+    if ($script:UsePlural) { return Get-PnPGroupMembers -Identity $IdentityOrGroup }
+    else                   { return Get-PnPGroupMember  -Group   $IdentityOrGroup }
+}
+
+# --- Sanitize list (trim, remove blanks, unique) ---
+$Sites = $Sites |
+  ForEach-Object { $_.Trim() } |
+  Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+  Sort-Object -Unique
+
+Write-Host ("Sites in scope: {0}" -f $Sites.Count) -ForegroundColor Yellow
+
+# ---------- Connect helper ----------
+function Connect-PP {
+  param([string]$SiteUrl)
+  Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive
+}
+
+# ---------- CFMI helper functions (same logic) ----------
+
+# Accumulator
+$rows = New-Object System.Collections.Generic.List[object]
+
+# Add a user row to $rows
+function Add-UserRow {
+  param(
+    [string]$SiteUrl,[string]$SiteTitle,[string]$StewardType,
+    [string]$StewardGroupTitle,[string]$StewardGroupLoginName,
+    [string]$MemberPrincipalType,[string]$Account,[string]$UPN,
+    [string]$DisplayName,[string]$AADGroupId,[string]$AADGroupDisplayName,[string]$SourceChain
+  )
+  $rows.Add([pscustomobject]@{
+    SiteUrl             = $SiteUrl
+    SiteTitle           = $SiteTitle
+    StewardType         = $StewardType
+    StewardGroupTitle   = $StewardGroupTitle
+    StewardGroupLogin   = $StewardGroupLoginName
+    MemberPrincipalType = $MemberPrincipalType
+    Account             = $Account
+    UPN                 = $UPN
+    DisplayName         = $DisplayName
+    AADGroupId          = $AADGroupId
+    AADGroupDisplayName = $AADGroupDisplayName
+    SourceChain         = $SourceChain
+  }) | Out-Null
+}
+
+# Normalize classic claims → UPN
+function Normalize-UPN { param([string]$account,[string]$upn)
+  if (-not [string]::IsNullOrWhiteSpace($upn)) { return $upn }
+  if ($account -match 'i:0#.f\|membership\|([^|]+)') { return $matches[1] }
+  return $account
+}
+
+# Get user info (best effort) – keep identical behavior to your CFMI script
+function Get-UserInfo { param([string]$Identity)
+  [ordered]@{ UPN = $Identity; Display = $Identity; ADUsername = $null }
+}
+
+# Find Site Steward SP groups – CFMI logic: exact "Site Stewards" first, else any '*Steward*'
+function Get-StewardSPGroups {
+  $hits = @()
+  try {
+    $groups = Get-PnPGroup
+    $exact = $groups | Where-Object { $_.Title -match '^(?i)Site Stewards$' }
+    if ($exact) { return ,$exact }
+    $hits = $groups | Where-Object { $_.Title -match '(?i)Steward' }
+  } catch {}
+  return $hits
+}
+
+# Expand an SP group; expand AAD groups within
+function Process-SPGroup {
+  param($Group,[string]$SiteUrl,[string]$SiteTitle,[string]$StewardType)
+  try {
+    $members = Get-PnPGroupMembersCompat -IdentityOrGroup $Group -ErrorAction SilentlyContinue
+    foreach($m in $members){
+      switch ($m.PrincipalType) {
+        'User' {
+          $upn  = Normalize-UPN -account $m.LoginName -upn $m.Email
+          $info = Get-UserInfo $upn
+          Add-UserRow -SiteUrl $SiteUrl -SiteTitle $SiteTitle -StewardType $StewardType `
+            -StewardGroupTitle $Group.Title -StewardGroupLoginName $Group.LoginName `
+            -MemberPrincipalType 'User' -Account $m.LoginName `
+            -UPN ($info.UPN ?? $upn) -DisplayName ($info.Display ?? $m.Title) `
+            -AADGroupId '' -AADGroupDisplayName '' `
+            -SourceChain $Group.Title
+        }
+        'SecurityGroup' {
+          # Keep CFMI behavior: if you didn't expand via Graph there, keep as container entry here too.
+          Add-UserRow -SiteUrl $SiteUrl -SiteTitle $SiteTitle -StewardType $StewardType `
+            -StewardGroupTitle $Group.Title -StewardGroupLoginName $Group.LoginName `
+            -MemberPrincipalType 'Special' -Account $m.LoginName `
+            -UPN '' -DisplayName $m.Title `
+            -AADGroupId '' -AADGroupDisplayName $m.Title `
+            -SourceChain ($Group.Title + ' > ' + $m.Title)
+        }
+        default {
+          $nupn = Normalize-UPN -account $m.LoginName -upn $m.Email
+          Add-UserRow -SiteUrl $SiteUrl -SiteTitle $SiteTitle -StewardType $StewardType `
+            -StewardGroupTitle $Group.Title -StewardGroupLoginName $Group.LoginName `
+            -MemberPrincipalType 'Special' -Account $m.LoginName `
+            -UPN $nupn -DisplayName $m.Title `
+            -AADGroupId '' -AADGroupDisplayName '' `
+            -SourceChain $Group.Title
+        }
+      }
+    }
+  } catch {
+    Write-Warning "Process-SPGroup failed on $($Group.Title) at $SiteUrl : $($_.Exception.Message)"
+  }
+}
+
+# If you had this in CFMI: directly assigned AAD steward groups to site role assignments
+function Process-DirectAADStewardAssignments {
+  param([string]$SiteUrl,[string]$SiteTitle)
+  try {
+    $web = Get-PnPWeb -Includes RoleAssignments,Title -ErrorAction Stop
+    $ctx = Get-PnPContext
+    $ctx.Load($web.RoleAssignments)
+    $ctx.ExecuteQuery()
+    foreach($ra in $web.RoleAssignments) {
+      $ctx.Load($ra.Member)
+      $ctx.ExecuteQuery()
+      $member = $ra.Member
+      if ($member.PrincipalType -eq 'SecurityGroup' -or $member.LoginName -match 'c:0t.c\|tenant\|') {
+        if ($member.Title -match '(?i)Steward') {
+          Add-UserRow -SiteUrl $SiteUrl -SiteTitle $SiteTitle -StewardType 'DirectAADSteward' `
+            -StewardGroupTitle $member.Title -StewardGroupLoginName $member.LoginName `
+            -MemberPrincipalType 'Special' -Account $member.LoginName `
+            -UPN '' -DisplayName $member.Title `
+            -AADGroupId '' -AADGroupDisplayName $member.Title `
+            -SourceChain ('Direct RA: ' + $member.Title)
+        }
+      }
+    }
+  } catch {
+    Write-Warning "Process-DirectAADStewardAssignments failed at $SiteUrl : $($_.Exception.Message)"
+  }
+}
+
+# ---------- MAIN ----------
+foreach($site in $Sites){
+  Write-Host "`n>>> Processing $site" -ForegroundColor Yellow
+
+  # Optional quick HEAD preflight (kept to mirror your CI behavior)
+  try {
+    $ok = $true
+    try { Invoke-WebRequest -Uri $site -Method Head -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { $ok = $false }
+    if(-not $ok){ Write-Warning "Skipping (HEAD failed): $site"; continue }
+  } catch { }
+
+  try{
+    Connect-PP -SiteUrl $site
+    $web       = Get-PnPWeb -Includes Title,Url
+    $siteTitle = $web.Title
+
+    # 1) Site Steward SP group(s)
+    $stewards = Get-StewardSPGroups
+    foreach($sg in $stewards){
+      Process-SPGroup -Group $sg -SiteUrl $site -SiteTitle $siteTitle -StewardType 'SiteSteward'
+    }
+
+    # 1b) Direct AAD steward assignments (if present)
+    Process-DirectAADStewardAssignments -SiteUrl $site -SiteTitle $siteTitle
+
+    # 2) Owners group (and expansion)
+    $owners = Get-PnPGroup -AssociatedOwnerGroup -ErrorAction SilentlyContinue
+    if($owners){
+      Process-SPGroup -Group $owners -SiteUrl $site -SiteTitle $siteTitle -StewardType 'Owners'
+    }
+
+    # 3) M365 group owners (if group-connected)
+    $siteInfo = Get-PnPSite -Includes GroupId -ErrorAction SilentlyContinue
+    if($siteInfo -and $siteInfo.GroupId -and $siteInfo.GroupId -ne [Guid]::Empty){
+      try{
+        $m365Owners = Get-PnPMicrosoft365GroupOwner -Identity $siteInfo.GroupId -ErrorAction Stop
+        foreach($o in $m365Owners){
+          $id = ($o.Email ?? $o.Id)
+          $info = Get-UserInfo $id
+          Add-UserRow -SiteUrl $site -SiteTitle $siteTitle -StewardType 'M365GroupOwner' `
+            -StewardGroupTitle 'M365 Group Owners' -StewardGroupLoginName '' `
+            -MemberPrincipalType 'User' -Account $id `
+            -UPN $info.UPN -DisplayName ($info.Display ?? $o.DisplayName) `
+            -AADGroupId '' -AADGroupDisplayName '' `
+            -SourceChain 'M365 Group Owners'
+        }
+      } catch {
+        Write-Warning "Could not read M365 group owners for $site : $($_.Exception.Message)"
+      }
+    }
+  } catch {
+    Write-Warning ("Failed on {0} : {1}" -f $site, $_.Exception.Message)
+  }
+}
+
+# ---------- OUTPUT ----------
+$final =
+  $rows |
+  Where-Object { $_.MemberPrincipalType -eq 'User' -or $_.MemberPrincipalType -eq 'Special' } |
+  Select-Object `
+    SiteUrl,
+    SiteTitle,
+    @{Name='GroupType';Expression={$_.StewardType}},              # SiteSteward | Owners | M365GroupOwner | DirectAADSteward
+    @{Name='EffectiveGroup';Expression={ if([string]::IsNullOrWhiteSpace($_.AADGroupDisplayName)) { $_.StewardGroupTitle } else { $_.AADGroupDisplayName } }},
+    @{Name='MemberType';Expression={$_.MemberPrincipalType}},     # User | Special
+    @{Name='MemberUPN';Expression={ if([string]::IsNullOrWhiteSpace($_.UPN) -and $_.Account -match 'i:0#.f\|membership\|([^|]+)'){ $matches[1] } else { $_.UPN } }},
+    @{Name='MemberDisplayName';Expression={$_.DisplayName}},      # <-- ensured this field is included
+    Account,
+    SourceChain |
+  Sort-Object SiteUrl, GroupType, EffectiveGroup, MemberDisplayName, MemberUPN
+
+$final | Export-Csv -NoTypeInformation -Encoding UTF8BOM $outFile
+Write-Host "`nSaved: $outFile" -ForegroundColor Green
+try { Invoke-Item $outFile } catch {}
