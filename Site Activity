@@ -1,0 +1,140 @@
+# =========================
+# RA - Inactive Sites & No Recent File Activity (PnP + CSOM)
+# - Flags "Inactive" using Web.LastItemModifiedDate (any site activity)
+# - Flags "No recent file activity" using Web.LastItemUserModifiedDate (user content changes)
+# - Saves to C:\Users\<username>\Documents
+# - Sets CSOM RequestTimeout = -1 and uses retry logic
+# =========================
+
+# --- Tenant App Details --- 
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# --- RA Sites to scan (deduped later) ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+$Sites = @(
+  'https://cppib.sharepoint.com/teams/RA-EnergyandResources2',
+  'https://cppib.sharepoint.com/teams/RA-Infrastructure',
+  'https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation',
+  'https://cppib.sharepoint.com/teams/RA-PowerandRenewables',
+  'https://cppib.sharepoint.com/teams/RA-RealAssets',
+  'https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin',
+  'https://cppib.sharepoint.com/teams/RA-RealEstate',
+  'https://cppib.sharepoint.com/teams/RA-RealEstateAsia',
+  'https://cppib.sharepoint.com/teams/RA-ManagementCommittee',
+  'https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup',
+  'https://cppib.sharepoint.com/sites/RA-Infra',
+  'https://cppib.sharepoint.com/sites/RA-LRA',
+  'https://cppib.sharepoint.com/sites/RA-RE',
+  'https://cppib.sharepoint.com/sites/RA-SE'
+)
+
+# --- Threshold (90 days) ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+[int]$DaysThreshold = 90
+
+# --- Output folder and file ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+$OutDir    = "C:\Users\$env:USERNAME\Documents"
+if (-not (Test-Path $OutDir)) { 
+    New-Item -Path $OutDir -ItemType Directory -Force | Out-Null 
+}
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+$outCsv    = Join-Path $OutDir ("RA_SiteActivity_{0}.csv" -f $timestamp)
+
+# --- Load PnP.PowerShell ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# --- Retry helper (for transient timeouts) ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory=$true)][scriptblock]$Script,
+        [string]$What = 'operation',
+        [int]$MaxAttempts = 3,
+        [int]$BaseDelaySeconds = 4
+    )
+    for ($i=1; $i -le $MaxAttempts; $i++){
+        try { return & $Script }
+        catch {
+            $msg = $_.Exception.Message
+            $isTimeout = ($msg -match 'HttpClient.Timeout' -or $msg -match 'timed out' -or $msg -match 'operation has timed out')
+            if ($isTimeout -and $i -lt $MaxAttempts) {
+                $delay = [math]::Pow(2, ($i-1)) * $BaseDelaySeconds
+                Write-Warning "$What timed out (attempt $i/$MaxAttempts). Retrying in $delay sec..."
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw
+        }
+    }
+}
+
+# --- Connect helper ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+function Connect-PP {
+    param([string]$SiteUrl)
+    Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive -ValidateConnection
+    $ctx = Get-PnPContext
+    try { $ctx.RequestTimeout = -1 } catch {}
+}
+
+# --- Collector ---  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+$rows = New-Object System.Collections.Generic.List[object]
+$now  = Get-Date
+
+# ================ MAIN LOOP ================
+foreach($s in ($Sites | Sort-Object -Unique)){
+
+    Write-Host "`n>>> Processing $s" -ForegroundColor Yellow
+
+    try{
+        Invoke-WithRetry -What "Connect $s" -Script { Connect-PP -SiteUrl $s }
+
+        # Pull activity dates  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+        $web = Invoke-WithRetry -What "Get-PnPWeb $s" -Script {
+            Get-PnPWeb -Includes Title,Url,LastItemModifiedDate,LastItemUserModifiedDate
+        }
+
+        $anyAct  = if ($web.LastItemModifiedDate)     { [datetime]$web.LastItemModifiedDate }     else { $null }
+        $fileAct = if ($web.LastItemUserModifiedDate) { [datetime]$web.LastItemUserModifiedDate } else { $null }
+
+        $daysSinceAnyActivity  = if ($anyAct)  { [math]::Round(($now - $anyAct).TotalDays,0) }  else { $null }
+        $daysSinceFileActivity = if ($fileAct) { [math]::Round(($now - $fileAct).TotalDays,0) } else { $null }
+
+        $inactive      = if ($daysSinceAnyActivity  -ge $DaysThreshold) { 'YES' } else { '' }
+        $noRecentFiles = if ($daysSinceFileActivity -ge $DaysThreshold) { 'YES' } else { '' }
+
+        $rows.Add([pscustomobject]@{
+            SiteUrl                     = $web.Url
+            SiteTitle                   = $web.Title
+            LastItemModifiedDateUTC     = if ($anyAct)  { (Get-Date $anyAct  -AsUTC).ToString("u") } else { '' }
+            LastItemUserModifiedDateUTC = if ($fileAct) { (Get-Date $fileAct -AsUTC).ToString("u") } else { '' }
+            DaysSinceAnyActivity        = $daysSinceAnyActivity
+            DaysSinceFileActivity       = $daysSinceFileActivity
+            Inactive_90Plus             = $inactive
+            NoRecentFileActivity_90Plus = $noRecentFiles
+            ThresholdDays               = $DaysThreshold
+        })
+    }
+    catch {
+        Write-Warning ("Failed on {0} : {1}" -f $s, $_.Exception.Message)
+
+        $rows.Add([pscustomobject]@{
+            SiteUrl                     = $s
+            SiteTitle                   = ''
+            LastItemModifiedDateUTC     = ''
+            LastItemUserModifiedDateUTC = ''
+            DaysSinceAnyActivity        = ''
+            DaysSinceFileActivity       = ''
+            Inactive_90Plus             = 'ERROR'
+            NoRecentFileActivity_90Plus = 'ERROR'
+            ThresholdDays               = $DaysThreshold
+        })
+
+        continue
+    }
+}
+
+# === OUTPUT (Always writes CSV; headers even with zero rows) ===  [1](https://cppib-my.sharepoint.com/personal/rnashad_cppib_com/Documents/Microsoft%20Copilot%20Chat%20Files/RA%20-%20Anonymous%20Links%20%20Metadata%20Standards%20%20Unique%20Permissions.txt)
+$rows |
+    Sort-Object Inactive_90Plus, NoRecentFileActivity_90Plus, DaysSinceAnyActivity, SiteUrl |
+    Export-Csv -NoTypeInformation -Encoding utf8BOM -Force $outCsv
+
+Write-Host "`nSaved: $outCsv" -ForegroundColor Green
+try { Invoke-Item $outCsv } catch {}
