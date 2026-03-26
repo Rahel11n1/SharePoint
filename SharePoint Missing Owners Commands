@@ -1,0 +1,209 @@
+
+# =========================
+# Identify Sites with Missing Owners
+# - Checks Owners SP group (users only, optional filtering of service accounts)
+# - Checks M365 Group Owners (for group-connected sites)
+# - Outputs one row per site with status
+# =========================
+
+# ----- Tenant & App -----
+$Tenant   = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# ----- Sites to process -----
+# (Use your department batch; you can paste more here as needed)
+$RA_Sites = @(
+  "https://cppib.sharepoint.com/teams/RA-EnergyandResources2",
+  "https://cppib.sharepoint.com/teams/RA-Infrastructure",
+  "https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation",
+  "https://cppib.sharepoint.com/teams/RA-PowerandRenewables",
+  "https://cppib.sharepoint.com/teams/RA-RealAssets",
+  "https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin",
+  "https://cppib.sharepoint.com/teams/RA-RealEstate",
+  "https://cppib.sharepoint.com/teams/RA-RealEstateAsia",
+  "https://cppib.sharepoint.com/teams/RA-ManagementCommittee",
+  "https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup",
+  "https://cppib.sharepoint.com/sites/CI-RealAssetsCredit",
+  "https://cppib.sharepoint.com/sites/RA-Infra",
+  "https://cppib.sharepoint.com/sites/RA-LRA",
+  "https://cppib.sharepoint.com/sites/RA-RE",
+  "https://cppib.sharepoint.com/sites/RA-SE"
+)
+
+# ----- Policy knobs (customize) -----
+# Minimum number of human owners required (either in SP Owners group or M365 Group Owners)
+$MinUserOwners = 1
+
+# Regex to EXCLUDE service/automation accounts when counting "human" owners.
+# Tweak to match your naming conventions.
+$ExcludeOwnersMatchingRegex = '(?i)^(svc[-_]|service[-_]|sp[-_]|automation|bot)|^(system account)$'
+
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+$outFile   = "RA_MissingOwners_${timestamp}.csv"
+
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+# ----- Connect helper -----
+function Connect-PP {
+  param([string]$SiteUrl)
+  Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive
+}
+
+# ----- Utility: is a "human user" principal? -----
+function Is-HumanUser {
+  param(
+    [object]$Member,
+    [string]$ExcludeRegex
+  )
+  if(-not $Member){ return $false }
+  # User principals only
+  if($Member.PrincipalType -ne 'User'){ return $false }
+
+  $title = $Member.Title
+  $login = $Member.LoginName
+
+  # Strip common claims prefix to inspect UPN clearly
+  $norm = $login `
+    -replace '^i:0#.f\|membership\|','' `
+    -replace '^i:0#.t\|','' `
+    -replace '^c:0t\.c\|tenant\|','' `
+    -replace '^c:0o\.c\|','' `
+    -replace '^spo\|',''
+
+  # Exclude well-known non-human principals or service patterns
+  if($title -match $ExcludeRegex -or $norm -match $ExcludeRegex){ return $false }
+
+  # Treat guests as human unless you want to exclude them here
+  return $true
+}
+
+# ----- Collect results -----
+$rows = New-Object System.Collections.Generic.List[Object]
+
+foreach($site in $AE_Sites){
+  Write-Host "`n>>> Processing $site" -ForegroundColor Yellow
+
+  $status       = 'Unknown'
+  $notes        = @()
+  $siteTitle    = ''
+  $isGrpConn    = $false
+  $ownersGrp    = ''
+  $spOwnersCnt  = 0
+  $spHumanCnt   = 0
+  $m365GroupId  = ''
+  $m365OwnersCnt= 0
+
+  try{
+    Connect-PP -SiteUrl $site
+
+    # Basic site info
+    $web = Get-PnPWeb -Includes Title,Url -ErrorAction Stop
+    $siteTitle = $web.Title
+
+    # Group-connected?
+    $siteInfo = Get-PnPSite -Includes GroupId -ErrorAction SilentlyContinue
+    if($siteInfo -and $siteInfo.GroupId -and $siteInfo.GroupId -ne [Guid]::Empty){
+      $isGrpConn   = $true
+      $m365GroupId = $siteInfo.GroupId.ToString()
+    }
+
+    # Owners SP group
+    $ownersGroup = Get-PnPGroup -AssociatedOwnerGroup -ErrorAction SilentlyContinue
+    if($ownersGroup){
+      $ownersGrp = $ownersGroup.Title
+      $members = @()
+      try{
+        $members = Get-PnPGroupMember -Group $ownersGroup -ErrorAction SilentlyContinue
+      } catch {
+        $notes += "Failed reading members of Owners group: $($_.Exception.Message)"
+      }
+
+      if($members){
+        $spOwnersCnt = @($members).Count
+        foreach($m in $members){
+          if(Is-HumanUser -Member $m -ExcludeRegex $ExcludeOwnersMatchingRegex){
+            $spHumanCnt++
+          }
+        }
+      } else {
+        $spOwnersCnt = 0
+        $spHumanCnt  = 0
+      }
+    } else {
+      $ownersGrp = '(none)'
+      $notes += 'No associated Owners SP group found'
+    }
+
+    # M365 Group owners (if group-connected)
+    if($isGrpConn){
+      try{
+        $m365Owners = Get-PnPMicrosoft365GroupOwner -Identity $siteInfo.GroupId -ErrorAction Stop
+        if($m365Owners){
+          # Count only user objects with a resolvable email/UPN
+          $m365OwnersCnt = @($m365Owners | Where-Object { $_.DisplayName -or $_.Email }).Count
+        } else {
+          $m365OwnersCnt = 0
+        }
+      } catch {
+        $notes += "Could not read M365 Group Owners: $($_.Exception.Message)"
+        $m365OwnersCnt = 0
+      }
+    }
+
+    # Determine status
+    # Any of these satisfies the minimum:
+    #  - M365 Group Owners (if group-connected) >= MinUserOwners
+    #  - OR Owners SP group human users >= MinUserOwners
+    if($isGrpConn){
+      if($m365OwnersCnt -ge $MinUserOwners -or $spHumanCnt -ge $MinUserOwners){
+        $status = 'OK'
+      } else {
+        if($ownersGrp -eq '(none)' -and $m365OwnersCnt -lt $MinUserOwners){
+          $status = 'MissingOwners (No SP Owners group & insufficient M365 owners)'
+        } elseif($spOwnersCnt -gt 0 -and $spHumanCnt -eq 0 -and $m365OwnersCnt -lt $MinUserOwners){
+          $status = 'MissingOwners (Only service/special accounts in SP Owners & insufficient M365 owners)'
+        } else {
+          $status = 'MissingOwners'
+        }
+      }
+    } else {
+      # Not group-connected: rely on SP Owners group human count
+      if($spHumanCnt -ge $MinUserOwners){
+        $status = 'OK'
+      } else {
+        if($ownersGrp -eq '(none)'){
+          $status = 'MissingOwners (No SP Owners group)'
+        } elseif($spOwnersCnt -gt 0 -and $spHumanCnt -eq 0){
+          $status = 'MissingOwners (Only service/special accounts in SP Owners)'
+        } else {
+          $status = 'MissingOwners'
+        }
+      }
+    }
+
+  } catch {
+    $status = 'Error'
+    $notes  = @("Failed: $($_.Exception.Message)")
+  }
+
+  $rows.Add([pscustomobject]@{
+    SiteUrl                 = $site
+    SiteTitle               = $siteTitle
+    IsGroupConnected        = $isGrpConn
+    OwnersGroupTitle        = $ownersGrp
+    SPOwners_TotalMembers   = $spOwnersCnt
+    SPOwners_HumanUsers     = $spHumanCnt
+    M365GroupId             = $m365GroupId
+    M365Group_OwnerCount    = $m365OwnersCnt
+    MinHumanOwnersRequired  = $MinUserOwners
+    Status                  = $status
+    Notes                   = ($notes -join ' | ')
+  })
+}
+
+# ----- OUTPUT -----
+$rows |
+  Sort-Object Status, SiteUrl |
+  Export-Csv -NoTypeInformation -Encoding utf8BOM $outFile
+
+Write-Host "`nSaved: $outFile" -ForegroundColor Green
