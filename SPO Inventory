@@ -1,0 +1,257 @@
+<#
+.SYNOPSIS
+ Inventory SharePoint sites and identify DIRECT user permissions (non-group) at the site level.
+.DESCRIPTION
+ Same behavior as CI command:
+  - Captures site metadata
+  - Exports all SharePoint groups (for context)
+  - Exports ONLY direct user principals at the site ROOT with their Role Definition(s) (permission names)
+  - Writes CSVs to %USERPROFILE%\Documents and Excel (if ImportExcel is available)
+#>
+
+# =============== Config ===============
+# Tenant / App
+$Tenant  = 'cppib.onmicrosoft.com'
+$ClientId = '2bc20a92-e59f-4a0c-9f95-8759b87e4325'
+
+# Target Sites
+# Option A: Inline list (edit per department)
+$TargetSites = @(
+  "https://cppib.sharepoint.com/teams/RA-EnergyandResources2",
+  "https://cppib.sharepoint.com/teams/RA-Infrastructure",
+  "https://cppib.sharepoint.com/teams/RA-PortfolioValueCreation",
+  "https://cppib.sharepoint.com/teams/RA-PowerandRenewables",
+  "https://cppib.sharepoint.com/teams/RA-RealAssets",
+  "https://cppib.sharepoint.com/teams/RA-RealAssetsAdmin",
+  "https://cppib.sharepoint.com/teams/RA-RealEstate",
+  "https://cppib.sharepoint.com/teams/RA-RealEstateAsia",
+  "https://cppib.sharepoint.com/teams/RA-ManagementCommittee",
+  "https://cppib.sharepoint.com/teams/RA-SustainableEnergyGroup",
+  "https://cppib.sharepoint.com/sites/RA-Infra",
+  "https://cppib.sharepoint.com/sites/RA-LRA",
+  "https://cppib.sharepoint.com/sites/RA-RE",
+  "https://cppib.sharepoint.com/sites/RA-SE"
+)
+
+# Option B: Load from file (one URL per line). Set $UseSitesFile = $true to use file.
+$UseSitesFile = $false
+$SitesFile    = ".\sites.txt"
+
+# Output paths
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmm')
+$DocsFolder = Join-Path $env:USERPROFILE 'Documents'
+$ExcelPath  = Join-Path $DocsFolder "SPO_Inventory_${timestamp}.xlsx"
+$CsvSites   = Join-Path $DocsFolder "Sites_${timestamp}.csv"
+$CsvGroups  = Join-Path $DocsFolder "Groups_${timestamp}.csv"
+$CsvPerms   = Join-Path $DocsFolder "Permissions_DirectUsers_${timestamp}.csv"
+
+# Optional: flag likely service accounts (for later filtering; not excluded)
+$ServiceAcctRegex = '(?i)^(svc[-_]|service[-_]|sp[-_]|automation|bot)'
+
+# =============== Imports & Helpers ===============
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+function Connect-Admin {
+  param([Parameter(Mandatory)] [string]$AdminUrl)
+  Connect-PnPOnline -Url $AdminUrl -ClientId $ClientId -Tenant $Tenant -Interactive
+}
+
+function Connect-Site {
+  param([Parameter(Mandatory)] [string]$SiteUrl)
+  Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $Tenant -Interactive
+}
+
+function Normalize-ClaimsToUpn {
+  param([string]$LoginName)
+  if([string]::IsNullOrWhiteSpace($LoginName)){ return '' }
+  $norm = $LoginName `
+    -replace '^i:0#.f\\membership\\','' `
+    -replace '^i:0#.t\\','' `
+    -replace '^c:0t\.c\\tenant\\','' `
+    -replace '^c:0o\.c\\','' `
+    -replace '^spo\\',''
+  if($norm -match '^[^@]+@[^@]+\.[^@]+$'){ return $norm }
+  return ''
+}
+
+function Is-GuestUpn {
+  param([string]$UpnOrLogin)
+  if([string]::IsNullOrWhiteSpace($UpnOrLogin)){ return $false }
+  if($UpnOrLogin -match '#EXT#'){ return $true }
+  return $false
+}
+
+# =============== Prepare Targets ===============
+$Sites = @()
+if($UseSitesFile -and (Test-Path $SitesFile)){
+  $Sites = Get-Content $SitesFile |
+           Where-Object { $_ -and $_ -match '^https?://' } |
+           ForEach-Object { [pscustomobject]@{ Url = ($_ -replace '\s+$','') } }
+} else {
+  $Sites = $TargetSites | ForEach-Object { [pscustomobject]@{ Url = $_ } }
+}
+
+if(-not $Sites -or $Sites.Count -eq 0){
+  Write-Host "No target sites found. Populate TargetSites or SitesFile." -ForegroundColor Red
+  break
+}
+
+# =============== Bootstrap Admin (token cache) ===============
+try {
+  Connect-Admin -AdminUrl "https://cppib-admin.sharepoint.com"
+} catch {
+  Write-Host "Admin center connection failed (continuing with per-site connects): $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# =============== Collections ===============
+$SiteInventory        = New-Object System.Collections.Generic.List[Object]
+$GroupInventory       = New-Object System.Collections.Generic.List[Object]
+$PermissionsInventory = New-Object System.Collections.Generic.List[Object]
+
+# =============== Main Loop ===============
+foreach ($site in $Sites) {
+  $siteUrl   = $site.Url
+  Write-Host "`nProcessing $siteUrl" -ForegroundColor Cyan
+  $siteTitle = ''
+  $sharing   = ''
+  $storageMB = $null
+  $lastAct   = $null
+  $template  = ''
+  $owners    = @()
+  $members   = @()
+  $visitors  = @()
+
+  try {
+    # Connect per site
+    Connect-Site -SiteUrl $siteUrl
+
+    # Tenant site metadata (Sharing/Storage/LastActivity/Template)
+    try {
+      $tSite     = Get-PnPTenantSite -Url $siteUrl -ErrorAction Stop
+      $sharing   = $tSite.SharingCapability
+      $storageMB = $tSite.StorageUsageCurrent
+      $lastAct   = $tSite.LastContentModifiedDate
+      $template  = $tSite.Template
+    } catch {
+      $sharing = ''; $storageMB = $null; $lastAct = $null; $template = ''
+    }
+
+    # Web info
+    $web       = Get-PnPWeb -Includes Title,Url,HasUniqueRoleAssignments -ErrorAction Stop
+    $siteTitle = $web.Title
+
+    # ----- Associated Groups (context) -----
+    try {
+      $gOwners   = Get-PnPGroup -AssociatedOwnerGroup   -ErrorAction SilentlyContinue
+      $gMembers  = Get-PnPGroup -AssociatedMemberGroup  -ErrorAction SilentlyContinue
+      $gVisitors = Get-PnPGroup -AssociatedVisitorGroup -ErrorAction SilentlyContinue
+      if ($gOwners)   { $owners   = Get-PnPGroupMember -Identity $gOwners.Title   -ErrorAction SilentlyContinue }
+      if ($gMembers)  { $members  = Get-PnPGroupMember -Identity $gMembers.Title  -ErrorAction SilentlyContinue }
+      if ($gVisitors) { $visitors = Get-PnPGroupMember -Identity $gVisitors.Title -ErrorAction SilentlyContinue }
+    } catch {}
+
+    # ----- All Groups (export) -----
+    try {
+      $groups = Get-PnPGroup -ErrorAction Stop
+      foreach ($g in $groups) {
+        $gmTitles    = @()
+        $ownerDisplay = ''
+        try {
+          Get-PnPProperty -ClientObject $g -Property Owner | Out-Null
+          if($g.Owner -and $g.Owner.LoginName){ $ownerDisplay = $g.Owner.Title }
+          elseif($g.OwnerTitle){ $ownerDisplay = $g.OwnerTitle }
+        } catch {}
+        try {
+          $gm = Get-PnPGroupMember -Identity $g.Title -ErrorAction Stop
+          if($gm){ $gmTitles = $gm | Select-Object -ExpandProperty Title }
+        } catch {}
+        $GroupInventory.Add([PSCustomObject]@{
+          SiteURL      = $siteUrl
+          GroupName    = $g.Title
+          GroupOwner   = $ownerDisplay
+          GroupMembers = ($gmTitles -join ";")
+        }) | Out-Null
+      }
+    } catch {}
+
+    # ----- DIRECT USER PERMISSIONS at ROOT WEB (with Roles) -----
+    try {
+      $roleAssignments = Get-PnPProperty -ClientObject $web -Property RoleAssignments
+      foreach ($ra in $roleAssignments) {
+        $member = Get-PnPProperty -ClientObject $ra -Property Member
+        $roles  = Get-PnPProperty -ClientObject $ra -Property RoleDefinitionBindings
+        if(-not $member){ continue }
+
+        # Keep only direct user principals
+        if ($member.PrincipalType -eq 'User') {
+          $login   = $member.LoginName
+          $upn     = Normalize-ClaimsToUpn -LoginName $login
+          $isGuest = (Is-GuestUpn -UpnOrLogin $login) -or (Is-GuestUpn -UpnOrLogin $upn)
+          $PermissionsInventory.Add([PSCustomObject]@{
+            SiteURL       = $siteUrl
+            SiteTitle     = $siteTitle
+            Principal     = $member.Title
+            PrincipalType = $member.PrincipalType # 'User'
+            LoginName     = $login
+            UPN           = $upn
+            Roles         = ($roles.Name -join ",") # <-- permission levels shown here
+            IsGuest       = $isGuest
+          }) | Out-Null
+        }
+      }
+    } catch {}
+
+    # ----- Site-level info row -----
+    $SiteInventory.Add([PSCustomObject]@{
+      URL         = $siteUrl
+      Title       = $siteTitle
+      Template    = $template
+      Owners      = ($owners  | Select-Object -ExpandProperty Title -ErrorAction SilentlyContinue) -join ";"
+      Members     = ($members | Select-Object -ExpandProperty Title -ErrorAction SilentlyContinue) -join ";"
+      Visitors    = ($visitors| Select-Object -ExpandProperty Title -ErrorAction SilentlyContinue) -join ";"
+      Sharing     = $sharing
+      StorageMB   = $storageMB
+      LastActivity= $lastAct
+    }) | Out-Null
+
+  } catch {
+    Write-Host "Error processing $siteUrl : $($_.Exception.Message)" -ForegroundColor Yellow
+    $SiteInventory.Add([PSCustomObject]@{
+      URL         = $siteUrl
+      Title       = ''
+      Template    = ''
+      Owners      = ''
+      Members     = ''
+      Visitors    = ''
+      Sharing     = ''
+      StorageMB   = $null
+      LastActivity= $null
+    }) | Out-Null
+  }
+}
+
+# =============== Export ===============
+$SiteInventory        | Sort-Object URL                    | Export-Csv -NoTypeInformation -Encoding utf8BOM $CsvSites
+$GroupInventory       | Sort-Object SiteURL, GroupName     | Export-Csv -NoTypeInformation -Encoding utf8BOM $CsvGroups
+$PermissionsInventory | Sort-Object SiteURL, Principal, UPN| Export-Csv -NoTypeInformation -Encoding utf8BOM $CsvPerms
+
+Write-Host "`nSaved CSVs:`n $CsvSites`n $CsvGroups`n $CsvPerms" -ForegroundColor Green
+
+# Optional Excel (if ImportExcel is present)
+$excelOk = $false
+try {
+  if (Get-Module -ListAvailable -Name ImportExcel) {
+    Import-Module ImportExcel -ErrorAction Stop
+    $SiteInventory        | Export-Excel -Path $ExcelPath -WorksheetName "Sites"        -AutoSize -BoldTopRow -ClearSheet -AutoFilter
+    $GroupInventory       | Export-Excel -Path $ExcelPath -WorksheetName "Groups"       -AutoSize -BoldTopRow -Append     -AutoFilter
+    $PermissionsInventory | Export-Excel -Path $ExcelPath -WorksheetName "Permissions"  -AutoSize -BoldTopRow -Append     -AutoFilter
+    $excelOk = $true
+  } else {
+    Write-Host "ImportExcel module not found—Excel export skipped. CSVs are available." -ForegroundColor Yellow
+  }
+} catch {
+  Write-Host "Excel export failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+if($excelOk){
+  Write-Host "Inventory export complete (Excel): $ExcelPath" -ForegroundColor Green
+}
