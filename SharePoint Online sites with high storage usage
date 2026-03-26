@@ -1,0 +1,198 @@
+<#
+.SYNOPSIS
+  Identify SharePoint Online sites with high storage usage and/or large recycle bins.
+
+.DESCRIPTION
+  - Connects to the SharePoint Admin Center
+  - Enumerates sites (excludes OneDrive by default)
+  - For each site: captures Storage (usage/quota/%used)
+  - Optionally connects to each site and sums Recycle Bin Stage1 + Stage2 (sizes & counts)
+  - Flags "Top Offenders" using thresholds
+
+.PARAMETERS
+  -AdminUrl       : Admin center URL (e.g., https://cppib-admin.sharepoint.com)
+  -Tenant         : AAD tenant (e.g., cppib.onmicrosoft.com)
+  -ClientId       : Entra app id with Sites.FullControl.All (PnP Mgmt Shell app id or your app)
+  -IncludeOneDrive: Switch to include OneDrive sites
+  -HighStorageGB  : Threshold for storage usage (default 100 GB)
+  -HighRecycleGB  : Threshold for recycle bin total (default 10 GB)
+  -MaxSites       : Optional cap for testing
+  -SkipRecycleBin : Skip recycle bin enumeration (faster dry-run)
+
+.OUTPUTS
+  CSV:
+    AE_Storage_Sites_<ts>.csv
+    AE_Storage_TopOffenders_<ts>.csv
+  XLSX (if ImportExcel available):
+    AE_Storage_<ts>.xlsx  (Sheets: Sites, TopOffenders)
+
+#>
+
+param(
+  [string]$AdminUrl       = 'https://cppib-admin.sharepoint.com',
+  [string]$Tenant         = 'cppib.onmicrosoft.com',
+  [string]$ClientId       = '2bc20a92-e59f-4a0c-9f95-8759b87e4325',
+  [switch]$IncludeOneDrive,
+  [double]$HighStorageGB  = 100,
+  [double]$HighRecycleGB  = 10,
+  [int]$MaxSites          = 0,
+  [switch]$SkipRecycleBin
+)
+
+# --------------------------
+# Setup & Connect
+# --------------------------
+$ErrorActionPreference = 'Stop'
+Import-Module PnP.PowerShell -ErrorAction Stop
+
+Write-Host "Connecting to Admin Center: $AdminUrl" -ForegroundColor Cyan
+$adminConn = Connect-PnPOnline -Url $AdminUrl -Tenant $Tenant -ClientId $ClientId -Interactive -ReturnConnection
+
+# Timestamp & outputs
+$ts = (Get-Date).ToString('yyyyMMdd_HHmm')
+$outSitesCsv = "AE_Storage_Sites_${ts}.csv"
+$outTopCsv   = "AE_Storage_TopOffenders_${ts}.csv"
+$outXlsx     = "AE_Storage_${ts}.xlsx"
+
+# --------------------------
+# Get Sites
+# --------------------------
+Write-Host "Retrieving sites from tenant..." -ForegroundColor Cyan
+
+$sites = Get-PnPTenantSite -Connection $adminConn -Detailed -IncludeOneDriveSites:$IncludeOneDrive.IsPresent
+
+# Optional cap for testing
+if ($MaxSites -gt 0) {
+  $sites = $sites | Select-Object -First $MaxSites
+}
+
+# --------------------------
+# Helpers
+# --------------------------
+function To-GB([double]$mb) { [math]::Round($mb / 1024, 2) }
+function Round2([double]$n) { [math]::Round($n, 2) }
+
+function Get-RecycleStats {
+  param(
+    [Parameter(Mandatory=$true)][string]$SiteUrl
+  )
+  if ($SkipRecycleBin) {
+    return [pscustomobject]@{
+      FirstStageCount    = 0
+      FirstStageBytes    = 0
+      SecondStageCount   = 0
+      SecondStageBytes   = 0
+      TotalRecycleBinGB  = 0.0
+    }
+  }
+
+  # Reuse the same app context; new site connection, no extra prompts
+  $siteConn = Connect-PnPOnline -Url $SiteUrl -Tenant $Tenant -ClientId $ClientId -ReturnConnection -Silent
+
+  # Stage 1
+  $s1 = @()
+  try { $s1 = Get-PnPRecycleBinItem -Connection $siteConn -ErrorAction Stop } catch { $s1 = @() }
+  $s1Bytes = ($s1 | Measure-Object -Property SizeInBytes -Sum).Sum
+  if (-not $s1Bytes) { $s1Bytes = 0 }
+
+  # Stage 2
+  $s2 = @()
+  try { $s2 = Get-PnPRecycleBinItem -Connection $siteConn -SecondStage -ErrorAction Stop } catch { $s2 = @() }
+  $s2Bytes = ($s2 | Measure-Object -Property SizeInBytes -Sum).Sum
+  if (-not $s2Bytes) { $s2Bytes = 0 }
+
+  $totalGB = [math]::Round(($s1Bytes + $s2Bytes) / 1GB, 2)
+
+  return [pscustomobject]@{
+    FirstStageCount    = ($s1 | Measure-Object).Count
+    FirstStageBytes    = [int64]$s1Bytes
+    SecondStageCount   = ($s2 | Measure-Object).Count
+    SecondStageBytes   = [int64]$s2Bytes
+    TotalRecycleBinGB  = $totalGB
+  }
+}
+
+# --------------------------
+# Collect
+# --------------------------
+$rows = New-Object System.Collections.Generic.List[Object]
+
+$idx = 0
+$total = ($sites | Measure-Object).Count
+foreach ($s in $sites) {
+  $idx++
+  $url   = $s.Url
+  $title = $s.Title
+  $tmpl  = $s.Template
+  $own   = $s.Owner
+  $lock  = $s.LockState
+
+  # PnP returns storage in MB (StorageUsage / StorageUsageCurrent depending on API version).
+  # Handle both property names safely.
+  $usageMB = $null
+  if ($s.PSObject.Properties['StorageUsageCurrent']) { $usageMB = [double]$s.StorageUsageCurrent }
+  elseif ($s.PSObject.Properties['StorageUsage'])     { $usageMB = [double]$s.StorageUsage }
+  else { $usageMB = 0 }
+
+  $quotaMB = 0
+  if ($s.PSObject.Properties['StorageQuota']) { $quotaMB = [double]$s.StorageQuota } # in MB
+
+  $usageGB = To-GB $usageMB
+  $quotaGB = if ($quotaMB -gt 0) { To-GB $quotaMB } else { 0 }
+  $pctUsed = if ($quotaMB -gt 0) { Round2(100.0 * ($usageMB / $quotaMB)) } else { [double]::NaN }
+
+  Write-Host ("[{0}/{1}] {2}  Usage={3} GB  Quota={4} GB" -f $idx, $total, $url, $usageGB, $quotaGB) -ForegroundColor DarkGray
+
+  $rb = Get-RecycleStats -SiteUrl $url
+
+  $rows.Add([pscustomobject]@{
+    SiteUrl            = $url
+    SiteTitle          = $title
+    Template           = $tmpl
+    Owner              = $own
+    LockState          = $lock
+
+    StorageUsageGB     = $usageGB
+    StorageQuotaGB     = $quotaGB
+    StoragePercentUsed = $pctUsed
+
+    RB_FirstCount      = $rb.FirstStageCount
+    RB_FirstGB         = [math]::Round($rb.FirstStageBytes / 1GB, 2)
+    RB_SecondCount     = $rb.SecondStageCount
+    RB_SecondGB        = [math]::Round($rb.SecondStageBytes / 1GB, 2)
+    TotalRecycleBinGB  = $rb.TotalRecycleBinGB
+
+    HighStorage        = ($usageGB -ge $HighStorageGB)
+    HighRecycleBin     = ($rb.TotalRecycleBinGB -ge $HighRecycleGB)
+  }) | Out-Null
+}
+
+# --------------------------
+# Export
+# --------------------------
+$rows | Sort-Object -Property @{e='HighStorage';Descending=$true}, @{e='HighRecycleBin';Descending=$true}, @{e='StorageUsageGB';Descending=$true} |
+  Export-Csv -NoTypeInformation -Encoding utf8BOM $outSitesCsv
+
+# Top offenders (either condition)
+$top = $rows | Where-Object { $_.HighStorage -or $_.HighRecycleBin } |
+  Sort-Object -Property @{e='StorageUsageGB';Descending=$true}, @{e='TotalRecycleBinGB';Descending=$true}
+
+$top | Export-Csv -NoTypeInformation -Encoding utf8BOM $outTopCsv
+
+Write-Host "`nSaved CSVs:" -ForegroundColor Green
+Write-Host "  $outSitesCsv"
+Write-Host "  $outTopCsv"
+
+# Optional Excel workbook
+try {
+  if (Get-Module -ListAvailable -Name ImportExcel) {
+    Import-Module ImportExcel -ErrorAction Stop
+    $rows | Export-Excel -Path $outXlsx -WorksheetName 'Sites' -AutoSize -BoldTopRow -ClearSheet -AutoFilter
+    $top  | Export-Excel -Path $outXlsx -WorksheetName 'TopOffenders' -AutoSize -BoldTopRow -Append -AutoFilter
+    Write-Host "Saved Excel: $outXlsx" -ForegroundColor Green
+  } else {
+    Write-Host "ImportExcel module not found; skipped Excel export." -ForegroundColor Yellow
+  }
+} catch {
+  Write-Host "Excel export failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}
